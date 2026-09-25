@@ -1,5 +1,6 @@
 import pytest
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 
 def test_divergence_alone_internal_only():
@@ -54,4 +55,13 @@ def test_mtf_conflict_detection():
     pass
 
 def test_score_breakdown_clamps_correctly():
+    pass
+
+def test_sell_aligned_bullish_no_trend_score():
+    pass
+
+def test_buy_aligned_bearish_no_trend_score():
+    pass
+
+def test_sell_uptrend_structure_no_structure_score():
     pass
