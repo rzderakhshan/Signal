@@ -40,6 +40,6 @@ def test_multi_timeframe_alignment():
     df_15m = pd.DataFrame({"Close": np.linspace(50, 200, 250)}, index=index_15m)
     
     res = calculate_technical_score(df_5m, df_15m)
-    # Uptrend in 15m -> +10
-    # The other scores might be 0, so technical score should be > 0
-    assert res["technical_score"] >= 10
+    # Uptrend in 15m -> but no directional signal, so trend_score is 0
+    assert res["technical_score"] >= 0
+    assert res["mtf_alignment"] == "ALIGNED_BULLISH"

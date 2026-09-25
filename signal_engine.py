@@ -157,6 +157,13 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
     if not np.isnan(ema50.iloc[-1]) and not np.isnan(ema200.iloc[-1]):
         trend_5m = "Bullish" if ema50.iloc[-1] > ema200.iloc[-1] else "Bearish"
         
+    # Determine internal direction from signals so far
+    bullish_ev = [s for s in signals if any(k in s for k in ["bullish", "up", "buy"])]
+    bearish_ev = [s for s in signals if any(k in s for k in ["bearish", "down", "sell"])]
+    internal_direction = "NEUTRAL"
+    if bullish_ev and not bearish_ev: internal_direction = "BUY"
+    elif bearish_ev and not bullish_ev: internal_direction = "SELL"
+    
     # 15m Trend
     trend_15m = "Neutral"
     mtf_alignment = "NEUTRAL"
@@ -174,13 +181,12 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
         
     if trend_5m == "Bullish" and trend_15m == "Bullish":
         mtf_alignment = "ALIGNED_BULLISH"
-        trend_score += 15
+        if internal_direction == "BUY": trend_score += 15
     elif trend_5m == "Bearish" and trend_15m == "Bearish":
         mtf_alignment = "ALIGNED_BEARISH"
-        trend_score += 15
+        if internal_direction == "SELL": trend_score += 15
     elif trend_5m != trend_15m and "Neutral" not in (trend_5m, trend_15m):
         mtf_alignment = "CONFLICTED"
-        trend_score -= 10
         
     # Volume spike and relative volume
     vol_sma = vol.rolling(20).mean()
@@ -199,7 +205,9 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
         signals.append("approaching_ema20")
         
     ms = analyze_market_structure(high, low, atr)
-    if ms != "Ranging":
+    if ms == "Uptrend" and internal_direction == "BUY":
+        structure_score += 15
+    elif ms == "Downtrend" and internal_direction == "SELL":
         structure_score += 15
         
     atr_val = atr.iloc[-1]
