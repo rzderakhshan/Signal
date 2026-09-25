@@ -264,7 +264,7 @@ def load_local_env(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        if key in {"TELEGRAM_BOT_TOKEN", "SIGNAL_CHAT_ID"}:
+        if key in {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "SIGNAL_CHAT_ID"}:
             os.environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
@@ -333,9 +333,12 @@ def main() -> int:
     args = parser.parse_args()
     load_local_env(args.env_file)
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("SIGNAL_CHAT_ID", "")
-    if not args.dry_run and not (token and chat_id):
-        print("Configure TELEGRAM_BOT_TOKEN and SIGNAL_CHAT_ID in local .env or environment", file=sys.stderr)
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", os.getenv("SIGNAL_CHAT_ID", ""))
+    
+    is_dry_run = args.dry_run or args.github_dry_run
+    
+    if not is_dry_run and not (token and chat_id):
+        print("Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in local .env or environment", file=sys.stderr)
         return 2
     if args.test_telegram:
         if args.dry_run:
@@ -374,8 +377,6 @@ def main() -> int:
         args.state.parent.mkdir(parents=True, exist_ok=True)
     if args.research_cache.parent:
         args.research_cache.parent.mkdir(parents=True, exist_ok=True)
-        
-    is_dry_run = args.dry_run or args.github_dry_run
         
     if not is_dry_run:
         try:
@@ -426,7 +427,7 @@ def main() -> int:
             continue
         msg = format_alert(alert, profiles.get(alert.symbol))
         if is_dry_run:
-            print(msg)
+            print(f"[DRY_RUN_ALERT_GENERATED] symbol={alert.symbol} side={alert.side} score={alert.score} reason={alert.reason}")
         else:
             try:
                 send_telegram(token, chat_id, msg)
@@ -442,7 +443,7 @@ def main() -> int:
     if report_due and rows:
         message = format_report(rows, profiles, now)
         if is_dry_run:
-            print(message)
+            print(f"[DRY_RUN_REPORT_GENERATED] {len(rows)} fresh market rows processed.")
         else:
             try:
                 send_telegram(token, chat_id, message)
