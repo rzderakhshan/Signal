@@ -1,0 +1,40 @@
+name: Intraday signal scanner
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2/5 * * * *'
+permissions:
+  contents: read
+concurrency:
+  group: intraday-scan
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            state.json
+            research_cache.json
+          key: scan-state-${{ github.run_id }}
+          restore-keys: scan-state-
+      - name: Scan and notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SIGNAL_CHAT_ID: ${{ secrets.SIGNAL_CHAT_ID }}
+        run: python scanner.py --state state.json
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            state.json
+            research_cache.json
+          key: scan-state-${{ github.run_id }}

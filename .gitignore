@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+state.json
+research_cache.json
+*.tmp
+*.pyc
+*.zip
+*.rar
+stock finder/
+Stock_market/
+reports/
+logs/

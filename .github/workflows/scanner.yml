@@ -1,0 +1,48 @@
+name: Intraday Signal Scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *' # Every 5 minutes, 24/7
+  workflow_dispatch: # Manual trigger
+
+concurrency:
+  group: scanner-group
+  cancel-in-progress: false # Do not cancel in-progress, let them finish to avoid state corruption
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+        
+      - name: Download State (Cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+            
+      - name: Run Scanner (Dry Run Mode)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py --github-dry-run
+
+      - name: Save State (Cache)
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .state/
+          key: scanner-state-${{ github.run_id }}

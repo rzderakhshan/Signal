@@ -1,0 +1,4 @@
+{
+  "stocks": ["AAPL", "NVDA", "TSLA", "AMD", "PLTR"],
+  "crypto": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR"]
+}
