@@ -129,26 +129,37 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
     p_up, p_mid, p_low = calc_bollinger_bands(close)
     r_up, r_mid, r_low = calc_bollinger_bands(rsi)
     
-    tech_score = 0
+    direction_score = 0
+    confirmation_score = 0
+    trend_score = 0
+    structure_score = 0
     signals = []
     
     # RSI Turning
     rsi_turn = analyze_rsi_turning(rsi)
-    tech_score += rsi_turn["score"]
+    direction_score += abs(rsi_turn["score"])
     if rsi_turn["score"] != 0: signals.append(rsi_turn["status"])
     
     # RSI Bollinger
     rsi_bb = analyze_rsi_bollinger(rsi, r_up, r_low)
-    tech_score += rsi_bb["score"]
+    direction_score += abs(rsi_bb["score"])
     if rsi_bb["score"] != 0: signals.append(rsi_bb["status"])
         
     # Price Bollinger
     pb = analyze_price_bollinger(close, p_up, p_low)
-    tech_score += pb["score"]
+    direction_score += abs(pb["score"])
     if pb["score"] != 0: signals.append(pb["status"])
     
-    mtf_alignment = "N/A"
-    # Trend Alignment with 15m
+    # 5m Trend
+    ema50 = close.ewm(span=50).mean()
+    ema200 = close.ewm(span=200).mean()
+    trend_5m = "Neutral"
+    if not np.isnan(ema50.iloc[-1]) and not np.isnan(ema200.iloc[-1]):
+        trend_5m = "Bullish" if ema50.iloc[-1] > ema200.iloc[-1] else "Bearish"
+        
+    # 15m Trend
+    trend_15m = "Neutral"
+    mtf_alignment = "NEUTRAL"
     if df_15m is not None and not df_15m.empty:
         current_time = df.index[-1]
         valid_15m = df_15m[df_15m.index <= current_time]
@@ -157,31 +168,40 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
             ema50_15m = c_15m.ewm(span=50).mean()
             ema200_15m = c_15m.ewm(span=200).mean()
             if not np.isnan(ema50_15m.iloc[-1]) and not np.isnan(ema200_15m.iloc[-1]):
-                if ema50_15m.iloc[-1] > ema200_15m.iloc[-1]: 
-                    tech_score += 10
-                    mtf_alignment = "Bullish"
-                else: 
-                    tech_score -= 10
-                    mtf_alignment = "Bearish"
+                trend_15m = "Bullish" if ema50_15m.iloc[-1] > ema200_15m.iloc[-1] else "Bearish"
     else:
-        ema50 = close.ewm(span=50).mean()
-        ema200 = close.ewm(span=200).mean()
-        if ema50.iloc[-1] > ema200.iloc[-1]: 
-            tech_score += 10
-            mtf_alignment = "Bullish (5m fallback)"
-        else: 
-            tech_score -= 10
-            mtf_alignment = "Bearish (5m fallback)"
-    
+        trend_15m = trend_5m
+        
+    if trend_5m == "Bullish" and trend_15m == "Bullish":
+        mtf_alignment = "ALIGNED_BULLISH"
+        trend_score += 15
+    elif trend_5m == "Bearish" and trend_15m == "Bearish":
+        mtf_alignment = "ALIGNED_BEARISH"
+        trend_score += 15
+    elif trend_5m != trend_15m and "Neutral" not in (trend_5m, trend_15m):
+        mtf_alignment = "CONFLICTED"
+        trend_score -= 10
+        
     # Volume spike and relative volume
     vol_sma = vol.rolling(20).mean()
     relative_volume = vol.iloc[-1] / vol_sma.iloc[-1] if vol_sma.iloc[-1] > 0 else 0
     if relative_volume > 2:
-        tech_score += 5 if close.iloc[-1] >= close.iloc[-2] else -5
+        confirmation_score += 15
         signals.append("volume_spike")
+    elif relative_volume > 1.5:
+        confirmation_score += 10
+        signals.append("volume_acceleration")
+        
+    # EMA Proximity
+    dist_20 = abs(close.iloc[-1] - ema50.iloc[-1]) / ema50.iloc[-1] if not np.isnan(ema50.iloc[-1]) else 1
+    if dist_20 < 0.002:
+        confirmation_score += 10
+        signals.append("approaching_ema20")
         
     ms = analyze_market_structure(high, low, atr)
-    
+    if ms != "Ranging":
+        structure_score += 15
+        
     atr_val = atr.iloc[-1]
     atr_percent = (atr_val / close.iloc[-1]) * 100 if close.iloc[-1] > 0 else 0
     
@@ -197,11 +217,20 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
         roc = (close.iloc[-1] - close.iloc[-10]) / close.iloc[-10] * 100
         momentum = f"{roc:.2f}%"
     
+    # Cap total
+    total = min(100, max(0, direction_score + confirmation_score + trend_score + structure_score))
+    
     return {
-        "technical_score": tech_score,
+        "technical_score": total,
+        "direction_score": max(0, direction_score),
+        "confirmation_score": max(0, confirmation_score),
+        "trend_score": max(0, trend_score),
+        "structure_score": max(0, structure_score),
         "signals": signals,
         "rsi": rsi.iloc[-1],
         "market_structure": ms,
+        "trend_5m": trend_5m,
+        "trend_15m": trend_15m,
         "mtf_alignment": mtf_alignment,
         "relative_volume": f"{relative_volume:.2f}x",
         "atr_percent": f"{atr_percent:.2f}%",

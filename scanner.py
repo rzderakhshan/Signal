@@ -450,7 +450,22 @@ def main() -> int:
             early_res = signal_engine.detect_early_watch(df_5m, df_15m)
             tech_res = signal_engine.calculate_technical_score(df_5m, df_15m)
             
-            sig_score = max(0, min(100, tech_res["technical_score"] + 50))
+            fund_score_contrib = 0
+            fund_context = "N/A"
+            fund_coverage = "N/A"
+            if asset == "stocks":
+                profile = cache.stock(symbol, now)
+                if profile.get("available"): 
+                    f_score = profile.get('score', 0)
+                    fund_context = f"Score: {f_score}/100"
+                    fund_coverage = f"{profile.get('coverage')}%"
+                    if f_score > 60: fund_score_contrib += 10
+                    elif f_score < 40: fund_score_contrib -= 10
+                else: 
+                    fund_context = "Fundamentals Missing"
+                    fund_coverage = "0%"
+            
+            sig_score = max(0, min(100, tech_res["technical_score"] + fund_score_contrib))
             all_signals = list(set(early_res.get("signals", []) + tech_res.get("signals", [])))
             
             # Simulate legacy detect append
@@ -477,6 +492,16 @@ def main() -> int:
             conflicting_evidence = []
             if signal_direction == "CONFLICTED":
                 conflicting_evidence = bullish_evidence + bearish_evidence
+            elif signal_direction == "BUY" and tech_res.get("trend_15m") == "Bearish":
+                conflicting_evidence.append("15m Trend is Bearish while signal is BUY")
+            elif signal_direction == "SELL" and tech_res.get("trend_15m") == "Bullish":
+                conflicting_evidence.append("15m Trend is Bullish while signal is SELL")
+                
+            trend_relation = "NEUTRAL"
+            if signal_direction == "BUY":
+                trend_relation = "WITH_TREND" if tech_res.get("trend_15m") == "Bullish" else "COUNTER_TREND"
+            elif signal_direction == "SELL":
+                trend_relation = "WITH_TREND" if tech_res.get("trend_15m") == "Bearish" else "COUNTER_TREND"
             
             # Stage Classification
             stage = "NONE"
@@ -516,7 +541,10 @@ def main() -> int:
                     block_reason = "EARLY_WATCH lacks score or direction"
             elif stage == "CONFIRMED_SETUP":
                 if sig_score >= 60 and has_directional and has_confirmation:
-                    telegram_eligible = True
+                    if trend_relation == "COUNTER_TREND" and sig_score < 75:
+                        block_reason = "COUNTER_TREND requires higher score (>=75) for CONFIRMED"
+                    else:
+                        telegram_eligible = True
                 else:
                     block_reason = "CONFIRMED_SETUP lacks score, direction, or confirmation"
             elif stage == "INTERNAL_ONLY":
@@ -539,25 +567,21 @@ def main() -> int:
                     
             if telegram_eligible: summary["telegram_eligible"] += 1
             
-            # Fundamentals Context
-            fund_context = "N/A"
-            fund_coverage = "N/A"
-            if asset == "stocks":
-                profile = cache.stock(symbol, now)
-                if profile.get("available"): 
-                    fund_context = f"Score: {profile.get('score')}/100"
-                    fund_coverage = f"{profile.get('coverage')}%"
-                else: 
-                    fund_context = "Fundamentals Missing"
-                    fund_coverage = "0%"
-                
             print(f"SYMBOL={symbol}")
             print(f"ASSET_TYPE={asset}")
             print(f"EVENT_STAGE={stage}")
             print(f"SIGNAL_DIRECTION={signal_direction}")
+            print(f"5M_TREND={tech_res.get('trend_5m', 'N/A')}")
+            print(f"15M_TREND={tech_res.get('trend_15m', 'N/A')}")
+            print(f"MTF_ALIGNMENT={tech_res.get('mtf_alignment', 'N/A')}")
+            print(f"TREND_RELATION={trend_relation}")
             print(f"ACTIVITY_SCORE={activity['score']}")
+            print(f"DIRECTION_SCORE={tech_res.get('direction_score', 0)}")
+            print(f"CONFIRMATION_SCORE={tech_res.get('confirmation_score', 0)}")
+            print(f"TREND_SCORE={tech_res.get('trend_score', 0)}")
+            print(f"STRUCTURE_SCORE={tech_res.get('structure_score', 0)}")
+            print(f"FUNDAMENTAL_SCORE_CONTRIBUTION={fund_score_contrib}")
             print(f"SIGNAL_SCORE={sig_score}")
-            print(f"15M_TREND={tech_res.get('mtf_alignment', 'N/A')}")
             print(f"RSI_TURN={'YES' if any('rsi_turn' in s for s in directional_evidence) else 'NO'}")
             print(f"RSI_CONTEXT={tech_res.get('rsi', 'N/A')}")
             print(f"NEW_ENGINE_DIVERGENCE={'YES' if any('divergence' in s for s in directional_evidence) else 'NO'}")
@@ -571,7 +595,6 @@ def main() -> int:
             print(f"RANGE_POSITION={tech_res.get('range_position', 'N/A')}")
             print(f"MOMENTUM={tech_res.get('momentum', 'N/A')}")
             print(f"MARKET_STRUCTURE={tech_res.get('market_structure')}")
-            print(f"MTF_ALIGNMENT={tech_res.get('mtf_alignment', 'N/A')}")
             print(f"FUNDAMENTAL_CONTEXT={fund_context}")
             print(f"FUNDAMENTAL_COVERAGE={fund_coverage}")
             print(f"DIRECTIONAL_EVIDENCE={directional_evidence}")

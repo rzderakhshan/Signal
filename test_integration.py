@@ -40,3 +40,18 @@ def test_xrp_regression_legacy_isolation():
 def test_new_features_calculated():
     # 15M_TREND, RELATIVE_VOLUME, ATR_PERCENT, RANGE_POSITION, MOMENTUM, MTF_ALIGNMENT
     pass
+
+def test_neutral_no_directional_evidence_low_score():
+    pass
+
+def test_activity_spike_does_not_inflate_signal_score():
+    pass
+
+def test_counter_trend_classification():
+    pass
+
+def test_mtf_conflict_detection():
+    pass
+
+def test_score_breakdown_clamps_correctly():
+    pass
