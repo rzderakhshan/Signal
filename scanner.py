@@ -455,32 +455,49 @@ def main() -> int:
             
             # Simulate legacy detect append
             legacy_alerts = detect(data_5m[symbol], symbol, asset, 5, now)
+            has_legacy_divergence = False
             for alert in legacy_alerts:
+                has_legacy_divergence = True
                 all_signals.append("legacy_divergence_" + alert.side)
                 
+            has_directional = any("rsi_turn" in s or "re_entry" in s or "divergence" in s for s in all_signals)
+            
             # Stage Classification
             stage = "NONE"
-            if "legacy_divergence_BUY WATCH" in all_signals or "legacy_divergence_SELL WATCH" in all_signals:
+            telegram_eligible = False
+            block_reason = "NONE"
+            
+            if has_legacy_divergence:
                 stage = "INTERNAL_ONLY"
+            
             if early_res.get("status") == "EARLY WATCH":
-                stage = "EARLY_WATCH"
-            if sig_score >= 60 and len(all_signals) > 0:
+                stage = "EARLY_WATCH" if stage == "NONE" else stage
+            
+            if sig_score >= 60 and has_directional:
                 stage = "CONFIRMED_SETUP"
                 
             if stage == "NONE": continue
             
-            telegram_eligible = False
-            block_reason = "NONE"
-            
+            # Telegram Eligibility (independent of stage)
+            if stage == "EARLY_WATCH":
+                if sig_score >= 40 and has_directional:
+                    telegram_eligible = True
+                else:
+                    block_reason = "EARLY_WATCH lacks score or direction"
+            elif stage == "CONFIRMED_SETUP":
+                if sig_score >= 60 and has_directional:
+                    telegram_eligible = True
+                else:
+                    block_reason = "CONFIRMED_SETUP lacks score or direction"
+            elif stage == "INTERNAL_ONLY":
+                block_reason = "INTERNAL_ONLY not eligible"
+                
             if stage == "INTERNAL_ONLY":
                 summary["internal_candidates"] += 1
-                block_reason = "INTERNAL_ONLY"
             elif stage == "EARLY_WATCH":
                 summary["early_watch"] += 1
-                telegram_eligible = True
             elif stage == "CONFIRMED_SETUP":
                 summary["confirmed_setups"] += 1
-                telegram_eligible = True
                 
             # Dedup & Alert Gating
             if telegram_eligible:
@@ -494,18 +511,39 @@ def main() -> int:
             
             # Fundamentals Context
             fund_context = "N/A"
+            fund_coverage = "N/A"
             if asset == "stocks":
                 profile = cache.stock(symbol, now)
-                if profile.get("available"): fund_context = f"Fundamental Score: {profile.get('score')}/100"
-                else: fund_context = "Fundamentals Missing"
+                if profile.get("available"): 
+                    fund_context = f"Score: {profile.get('score')}/100"
+                    fund_coverage = f"{profile.get('coverage')}%"
+                else: 
+                    fund_context = "Fundamentals Missing"
+                    fund_coverage = "0%"
                 
             print(f"SYMBOL={symbol}")
             print(f"ASSET_TYPE={asset}")
             print(f"EVENT_STAGE={stage}")
             print(f"ACTIVITY_SCORE={activity['score']}")
             print(f"SIGNAL_SCORE={sig_score}")
+            print(f"15M_TREND=N/A")
+            print(f"RSI_TURN={'YES' if any('rsi_turn' in s for s in all_signals) else 'NO'}")
+            print(f"RSI_CONTEXT={tech_res.get('rsi', 'N/A')}")
+            print(f"DIVERGENCE={'YES' if has_legacy_divergence else 'NO'}")
+            print(f"RSI_BOLLINGER={'YES' if any('rsi_re_entry' in s for s in all_signals) else 'NO'}")
+            print(f"PRICE_BOLLINGER={'YES' if any('price_re_entry' in s for s in all_signals) else 'NO'}")
+            print(f"EMA20_CONTEXT={'YES' if any('ema' in s for s in all_signals) else 'N/A'}")
+            print(f"RELATIVE_VOLUME=N/A")
+            print(f"VOLUME_SPIKE={'YES' if any('volume_spike' in s for s in all_signals) else 'NO'}")
+            print(f"ATR_PERCENT=N/A")
+            print(f"RANGE_POSITION=N/A")
+            print(f"MOMENTUM=N/A")
             print(f"MARKET_STRUCTURE={tech_res.get('market_structure')}")
+            print(f"MTF_ALIGNMENT=N/A")
+            print(f"FUNDAMENTAL_CONTEXT={fund_context}")
+            print(f"FUNDAMENTAL_COVERAGE={fund_coverage}")
             print(f"HOT_WATCHLIST={is_hot}")
+            print(f"FULL_ANALYSIS_REASON={'HOT' if is_hot else 'PERIODIC_30M'}")
             print(f"TELEGRAM_ELIGIBLE={telegram_eligible}")
             print(f"REASONS={all_signals}")
             print(f"BLOCK_REASON={block_reason}")
