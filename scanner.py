@@ -23,6 +23,8 @@ import pandas as pd
 import telegram_utils
 
 from research import ResearchCache, atomic_json
+import activity_monitor
+import signal_engine
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -369,94 +371,162 @@ def main() -> int:
     except (OSError, ValueError):
         state = {}
     now = datetime.now(timezone.utc)
+    
+    # State cleanup
     state = {key: stamp for key, stamp in state.items()
              if isinstance(stamp, (int, float)) and 0 <= now.timestamp() - stamp < 7 * 86400}
-             
-    # Ensure state directory exists
-    if args.state.parent:
-        args.state.parent.mkdir(parents=True, exist_ok=True)
-    if args.research_cache.parent:
-        args.research_cache.parent.mkdir(parents=True, exist_ok=True)
+    if "hot_watchlist" not in state or not isinstance(state["hot_watchlist"], dict): state["hot_watchlist"] = {}
+    if "alert_history" not in state or not isinstance(state["alert_history"], dict): state["alert_history"] = {}
+    
+    if args.state.parent: args.state.parent.mkdir(parents=True, exist_ok=True)
+    if args.research_cache.parent: args.research_cache.parent.mkdir(parents=True, exist_ok=True)
         
-    if not is_dry_run:
-        try:
-            atomic_json(args.state, state)
-        except Exception as e:
-            print(f"Warning: Failed to save state: {e}", file=sys.stderr)
-    alerts = []
-    rows = []
-    received_any = False
+    monitor = activity_monitor.ActivityMonitor()
+    # Recover hot watchlist (filter expired)
+    current_ts = now.timestamp()
+    monitor.hot_watchlist = {k: datetime.fromtimestamp(v, timezone.utc) for k, v in state["hot_watchlist"].items() if v > current_ts}
+    monitor.alert_history = {k: {'time': datetime.fromtimestamp(v['time'], timezone.utc), 'signals': v['signals']} for k, v in state["alert_history"].items()}
+    
     universe = list(dict.fromkeys(symbols["stocks"] + symbols["crypto"]))
-    for minutes in (5, 15):
-        try:
-            data = fetch(universe, minutes, symbols["crypto"])
-        except Exception as exc:
-            print(f"{minutes}m feed error ({type(exc).__name__})", file=sys.stderr)
-            continue
-        received_any |= bool(data)
-        print(f"{minutes}m: received {len(data)}/{len(universe)} symbols; missing: {sorted(set(universe) - set(data))}")
-        for asset, names in symbols.items():
-            for symbol in names:
-                if symbol in data:
-                    source = data[symbol].attrs.get("source", "Yahoo")
-                    alerts.extend(detect(data[symbol], symbol, asset, minutes, now, source))
-                    if minutes == 5:
-                        row = market_row(data[symbol], symbol, asset, minutes, now, source)
-                        if row is not None:
-                            rows.append(row)
-    if not received_any:
+    data_5m = {}
+    data_15m = {}
+    
+    try:
+        data_5m = fetch(universe, 5, symbols["crypto"])
+    except Exception as exc:
+        print(f"5m feed error ({type(exc).__name__})", file=sys.stderr)
+    try:
+        data_15m = fetch(universe, 15, symbols["crypto"])
+    except Exception as exc:
+        print(f"15m feed error ({type(exc).__name__})", file=sys.stderr)
+        
+    if not data_5m:
         print("No market data received; check Yahoo availability and ticker spelling", file=sys.stderr)
         return 1
-    alerts.sort(key=lambda a: a.score, reverse=True)
-    rows.sort(key=lambda r: r.volatility_score, reverse=True)
-    print(f"Fresh market rows: {len(rows)}; highest volatility: {[r.symbol for r in rows[:5]]}; new alert candidates: {len(alerts)}")
-    report_key = "report|" + now.astimezone(BERLIN).strftime("%Y-%m-%dT%H")
-    report_due = args.report_now or args.dry_run or (now.astimezone(BERLIN).hour in {9, 12, 16, 20} and report_key not in state)
+        
     cache = ResearchCache(args.research_cache)
-    profiles = {}
-    needed = {a.symbol for a in alerts[:8] if a.asset == "stocks"}
-    if report_due:
-        needed.update(r.symbol for r in rows if r.asset == "stocks")
-    for symbol in sorted(needed):
-        profiles[symbol] = cache.stock(symbol, now)
-        # First uncached run is deliberately small, but avoid bursting info/news calls.
-        if profiles[symbol].get("fetched_at", 0) >= now.timestamp() - 2 and len(needed) > 1:
-            time.sleep(0.2)
-    for alert in alerts[:8]:
-        if alert.key in state:
-            continue
-        msg = format_alert(alert, profiles.get(alert.symbol))
-        if is_dry_run:
-            print(f"[DRY_RUN_ALERT_GENERATED] symbol={alert.symbol} side={alert.side} score={alert.score} reason={alert.reason}")
-        else:
-            try:
-                send_telegram(token, chat_id, msg)
-            except Exception as exc:
-                # HTTP errors can include the request URL, which contains the bot token.
-                print(f"Telegram send failed ({type(exc).__name__}); check bot/channel permissions", file=sys.stderr)
-                return 1
-            state[alert.key] = now.timestamp()
-            try:
-                atomic_json(args.state, state)
-            except Exception as e:
-                print(f"Warning: Failed to save state: {e}", file=sys.stderr)
-    if report_due and rows:
-        message = format_report(rows, profiles, now)
-        if is_dry_run:
-            print(f"[DRY_RUN_REPORT_GENERATED] {len(rows)} fresh market rows processed.")
-        else:
-            try:
-                send_telegram(token, chat_id, message)
-            except Exception as exc:
-                print(f"Telegram report failed ({type(exc).__name__}); check bot/channel permissions", file=sys.stderr)
-                return 1
-            state[report_key] = now.timestamp()
-            try:
-                atomic_json(args.state, state)
-            except Exception as e:
-                print(f"Warning: Failed to save state: {e}", file=sys.stderr)
-    return 0
+    
+    last_30m = state.get("last_30m_scan", 0)
+    is_periodic_30m = (now.timestamp() - last_30m) > 1800
+    if is_periodic_30m: state["last_30m_scan"] = now.timestamp()
 
+    summary = {
+        "symbols_scanned": len(data_5m),
+        "fresh_symbols": 0,
+        "hot_symbols": 0,
+        "full_analysis_count": 0,
+        "internal_candidates": 0,
+        "early_watch": 0,
+        "confirmed_setups": 0,
+        "telegram_eligible": 0,
+        "dedup_blocked": 0,
+        "stale_or_failed": len(universe) - len(data_5m)
+    }
+
+    for asset, names in symbols.items():
+        for symbol in names:
+            if symbol not in data_5m: continue
+            
+            df_5m = closed_bars(data_5m[symbol], 5, now)
+            if df_5m.empty or len(df_5m) < 50:
+                summary["stale_or_failed"] += 1
+                continue
+            
+            summary["fresh_symbols"] += 1
+            
+            # Fast Activity Scan
+            activity = monitor.calc_activity_score(df_5m)
+            monitor.update_hot_watchlist(symbol, activity, now)
+            is_hot = monitor.is_hot(symbol)
+            if is_hot: summary["hot_symbols"] += 1
+            
+            # Gating for Full Analysis
+            if not is_hot and not is_periodic_30m:
+                continue
+                
+            summary["full_analysis_count"] += 1
+            df_15m = closed_bars(data_15m[symbol], 15, now) if symbol in data_15m else None
+            
+            early_res = signal_engine.detect_early_watch(df_5m, df_15m)
+            tech_res = signal_engine.calculate_technical_score(df_5m, df_15m)
+            
+            sig_score = max(0, min(100, tech_res["technical_score"] + 50))
+            all_signals = list(set(early_res.get("signals", []) + tech_res.get("signals", [])))
+            
+            # Simulate legacy detect append
+            legacy_alerts = detect(data_5m[symbol], symbol, asset, 5, now)
+            for alert in legacy_alerts:
+                all_signals.append("legacy_divergence_" + alert.side)
+                
+            # Stage Classification
+            stage = "NONE"
+            if "legacy_divergence_BUY WATCH" in all_signals or "legacy_divergence_SELL WATCH" in all_signals:
+                stage = "INTERNAL_ONLY"
+            if early_res.get("status") == "EARLY WATCH":
+                stage = "EARLY_WATCH"
+            if sig_score >= 60 and len(all_signals) > 0:
+                stage = "CONFIRMED_SETUP"
+                
+            if stage == "NONE": continue
+            
+            telegram_eligible = False
+            block_reason = "NONE"
+            
+            if stage == "INTERNAL_ONLY":
+                summary["internal_candidates"] += 1
+                block_reason = "INTERNAL_ONLY"
+            elif stage == "EARLY_WATCH":
+                summary["early_watch"] += 1
+                telegram_eligible = True
+            elif stage == "CONFIRMED_SETUP":
+                summary["confirmed_setups"] += 1
+                telegram_eligible = True
+                
+            # Dedup & Alert Gating
+            if telegram_eligible:
+                payload = {"signals": [stage] + all_signals}
+                if not monitor.should_send_alert(symbol, payload, now):
+                    telegram_eligible = False
+                    block_reason = "DEDUP_BLOCKED"
+                    summary["dedup_blocked"] += 1
+                    
+            if telegram_eligible: summary["telegram_eligible"] += 1
+            
+            # Fundamentals Context
+            fund_context = "N/A"
+            if asset == "stocks":
+                profile = cache.stock(symbol, now)
+                if profile.get("available"): fund_context = f"Fundamental Score: {profile.get('score')}/100"
+                else: fund_context = "Fundamentals Missing"
+                
+            print(f"SYMBOL={symbol}")
+            print(f"ASSET_TYPE={asset}")
+            print(f"EVENT_STAGE={stage}")
+            print(f"ACTIVITY_SCORE={activity['score']}")
+            print(f"SIGNAL_SCORE={sig_score}")
+            print(f"MARKET_STRUCTURE={tech_res.get('market_structure')}")
+            print(f"HOT_WATCHLIST={is_hot}")
+            print(f"TELEGRAM_ELIGIBLE={telegram_eligible}")
+            print(f"REASONS={all_signals}")
+            print(f"BLOCK_REASON={block_reason}")
+            print("---")
+            
+            if telegram_eligible and not is_dry_run:
+                msg = f"🔥 {stage} | {symbol} | {asset} | Score: {sig_score}/100\nSignals: {', '.join(all_signals)}\nContext: {fund_context}"
+                try: send_telegram(token, chat_id, msg)
+                except Exception as e: print(f"Telegram failed: {e}")
+                
+    state["hot_watchlist"] = {k: v.timestamp() for k, v in monitor.hot_watchlist.items()}
+    state["alert_history"] = {k: {'time': v['time'].timestamp(), 'signals': v['signals']} for k, v in monitor.alert_history.items()}
+    
+    if not is_dry_run:
+        try: atomic_json(args.state, state)
+        except Exception as e: print(f"Warning: Failed to save state: {e}", file=sys.stderr)
+        
+    print("RUN_SUMMARY")
+    for k, v in summary.items(): print(f"{k}={v}")
+    
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
