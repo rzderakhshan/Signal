@@ -147,10 +147,9 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
     tech_score += pb["score"]
     if pb["score"] != 0: signals.append(pb["status"])
     
+    mtf_alignment = "N/A"
     # Trend Alignment with 15m
     if df_15m is not None and not df_15m.empty:
-        # Get the latest 15m candle that is CLOSED relative to current 5m time
-        # Assume df index is datetime. We find the latest 15m index strictly <= current index
         current_time = df.index[-1]
         valid_15m = df_15m[df_15m.index <= current_time]
         if not valid_15m.empty:
@@ -158,25 +157,54 @@ def calculate_technical_score(df: pd.DataFrame, df_15m: pd.DataFrame = None) -> 
             ema50_15m = c_15m.ewm(span=50).mean()
             ema200_15m = c_15m.ewm(span=200).mean()
             if not np.isnan(ema50_15m.iloc[-1]) and not np.isnan(ema200_15m.iloc[-1]):
-                if ema50_15m.iloc[-1] > ema200_15m.iloc[-1]: tech_score += 10
-                else: tech_score -= 10
+                if ema50_15m.iloc[-1] > ema200_15m.iloc[-1]: 
+                    tech_score += 10
+                    mtf_alignment = "Bullish"
+                else: 
+                    tech_score -= 10
+                    mtf_alignment = "Bearish"
     else:
         ema50 = close.ewm(span=50).mean()
         ema200 = close.ewm(span=200).mean()
-        if ema50.iloc[-1] > ema200.iloc[-1]: tech_score += 10
-        else: tech_score -= 10
+        if ema50.iloc[-1] > ema200.iloc[-1]: 
+            tech_score += 10
+            mtf_alignment = "Bullish (5m fallback)"
+        else: 
+            tech_score -= 10
+            mtf_alignment = "Bearish (5m fallback)"
     
-    # Volume spike
+    # Volume spike and relative volume
     vol_sma = vol.rolling(20).mean()
-    if vol.iloc[-1] > vol_sma.iloc[-1] * 2:
+    relative_volume = vol.iloc[-1] / vol_sma.iloc[-1] if vol_sma.iloc[-1] > 0 else 0
+    if relative_volume > 2:
         tech_score += 5 if close.iloc[-1] >= close.iloc[-2] else -5
         signals.append("volume_spike")
         
     ms = analyze_market_structure(high, low, atr)
     
+    atr_val = atr.iloc[-1]
+    atr_percent = (atr_val / close.iloc[-1]) * 100 if close.iloc[-1] > 0 else 0
+    
+    range_position = "N/A"
+    if len(close) > 20:
+        recent_high = high.rolling(20).max().iloc[-1]
+        recent_low = low.rolling(20).min().iloc[-1]
+        if recent_high > recent_low:
+            range_position = f"{((close.iloc[-1] - recent_low) / (recent_high - recent_low) * 100):.1f}%"
+    
+    momentum = "N/A"
+    if len(close) > 10:
+        roc = (close.iloc[-1] - close.iloc[-10]) / close.iloc[-10] * 100
+        momentum = f"{roc:.2f}%"
+    
     return {
         "technical_score": tech_score,
         "signals": signals,
         "rsi": rsi.iloc[-1],
-        "market_structure": ms
+        "market_structure": ms,
+        "mtf_alignment": mtf_alignment,
+        "relative_volume": f"{relative_volume:.2f}x",
+        "atr_percent": f"{atr_percent:.2f}%",
+        "range_position": range_position,
+        "momentum": momentum
     }

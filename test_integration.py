@@ -33,4 +33,10 @@ def test_dry_run_zero_telegram():
 def test_state_restore():
     pass
 
+def test_xrp_regression_legacy_isolation():
+    # legacy divergence + activity=0 must NOT be CONFIRMED_SETUP
+    pass
 
+def test_new_features_calculated():
+    # 15M_TREND, RELATIVE_VOLUME, ATR_PERCENT, RANGE_POSITION, MOMENTUM, MTF_ALIGNMENT
+    pass

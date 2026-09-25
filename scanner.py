@@ -456,39 +456,69 @@ def main() -> int:
             # Simulate legacy detect append
             legacy_alerts = detect(data_5m[symbol], symbol, asset, 5, now)
             has_legacy_divergence = False
+            legacy_diagnostics = []
             for alert in legacy_alerts:
                 has_legacy_divergence = True
-                all_signals.append("legacy_divergence_" + alert.side)
+                diag = f"legacy_divergence_{alert.side}"
+                legacy_diagnostics.append(diag)
                 
-            has_directional = any("rsi_turn" in s or "re_entry" in s or "divergence" in s for s in all_signals)
+            directional_evidence = [s for s in all_signals if any(k in s for k in ["rsi_turn", "re_entry", "divergence"]) and not s.startswith("legacy_")]
+            has_directional = len(directional_evidence) > 0
+            
+            # Extract direction
+            bullish_evidence = [s for s in all_signals if any(k in s for k in ["bullish", "up", "buy"]) and not s.startswith("legacy_")]
+            bearish_evidence = [s for s in all_signals if any(k in s for k in ["bearish", "down", "sell"]) and not s.startswith("legacy_")]
+            
+            signal_direction = "NEUTRAL"
+            if bullish_evidence and not bearish_evidence: signal_direction = "BUY"
+            elif bearish_evidence and not bullish_evidence: signal_direction = "SELL"
+            elif bullish_evidence and bearish_evidence: signal_direction = "CONFLICTED"
+            
+            conflicting_evidence = []
+            if signal_direction == "CONFLICTED":
+                conflicting_evidence = bullish_evidence + bearish_evidence
             
             # Stage Classification
             stage = "NONE"
             telegram_eligible = False
             block_reason = "NONE"
             
-            if has_legacy_divergence:
-                stage = "INTERNAL_ONLY"
-            
+            # Start with base evaluations
             if early_res.get("status") == "EARLY WATCH":
-                stage = "EARLY_WATCH" if stage == "NONE" else stage
+                stage = "EARLY_WATCH"
             
-            if sig_score >= 60 and has_directional:
+            # CONFIRMED_SETUP takes precedence if score is high and it has directional evidence
+            # Requires multi-factor confluence
+            confirmation_evidence = [s for s in all_signals if s not in directional_evidence and not s.startswith("legacy_")]
+            has_confirmation = len(confirmation_evidence) > 0
+            
+            if sig_score >= 60 and has_directional and has_confirmation:
                 stage = "CONFIRMED_SETUP"
+                
+            # Legacy divergence isolation
+            # If ONLY legacy divergence exists and no new engine stage was assigned, it forces INTERNAL_ONLY
+            if has_legacy_divergence and stage == "NONE":
+                stage = "INTERNAL_ONLY"
+            elif has_legacy_divergence and not has_directional:
+                # Override to INTERNAL_ONLY if legacy was trying to ride on high score without direction
+                stage = "INTERNAL_ONLY"
                 
             if stage == "NONE": continue
             
             # Telegram Eligibility (independent of stage)
-            if stage == "EARLY_WATCH":
+            if signal_direction in ("NEUTRAL", "CONFLICTED"):
+                telegram_eligible = False
+                block_reason = f"Direction is {signal_direction}"
+            elif stage == "EARLY_WATCH":
                 if sig_score >= 40 and has_directional:
                     telegram_eligible = True
                 else:
                     block_reason = "EARLY_WATCH lacks score or direction"
             elif stage == "CONFIRMED_SETUP":
-                if sig_score >= 60 and has_directional:
+                if sig_score >= 60 and has_directional and has_confirmation:
                     telegram_eligible = True
                 else:
-                    block_reason = "CONFIRMED_SETUP lacks score or direction"
+                    block_reason = "CONFIRMED_SETUP lacks score, direction, or confirmation"
             elif stage == "INTERNAL_ONLY":
                 block_reason = "INTERNAL_ONLY not eligible"
                 
@@ -524,24 +554,29 @@ def main() -> int:
             print(f"SYMBOL={symbol}")
             print(f"ASSET_TYPE={asset}")
             print(f"EVENT_STAGE={stage}")
+            print(f"SIGNAL_DIRECTION={signal_direction}")
             print(f"ACTIVITY_SCORE={activity['score']}")
             print(f"SIGNAL_SCORE={sig_score}")
-            print(f"15M_TREND=N/A")
-            print(f"RSI_TURN={'YES' if any('rsi_turn' in s for s in all_signals) else 'NO'}")
+            print(f"15M_TREND={tech_res.get('mtf_alignment', 'N/A')}")
+            print(f"RSI_TURN={'YES' if any('rsi_turn' in s for s in directional_evidence) else 'NO'}")
             print(f"RSI_CONTEXT={tech_res.get('rsi', 'N/A')}")
-            print(f"DIVERGENCE={'YES' if has_legacy_divergence else 'NO'}")
-            print(f"RSI_BOLLINGER={'YES' if any('rsi_re_entry' in s for s in all_signals) else 'NO'}")
-            print(f"PRICE_BOLLINGER={'YES' if any('price_re_entry' in s for s in all_signals) else 'NO'}")
-            print(f"EMA20_CONTEXT={'YES' if any('ema' in s for s in all_signals) else 'N/A'}")
-            print(f"RELATIVE_VOLUME=N/A")
-            print(f"VOLUME_SPIKE={'YES' if any('volume_spike' in s for s in all_signals) else 'NO'}")
-            print(f"ATR_PERCENT=N/A")
-            print(f"RANGE_POSITION=N/A")
-            print(f"MOMENTUM=N/A")
+            print(f"NEW_ENGINE_DIVERGENCE={'YES' if any('divergence' in s for s in directional_evidence) else 'NO'}")
+            print(f"LEGACY_DIAGNOSTIC={legacy_diagnostics}")
+            print(f"RSI_BOLLINGER={'YES' if any('rsi_re_entry' in s for s in directional_evidence) else 'NO'}")
+            print(f"PRICE_BOLLINGER={'YES' if any('price_re_entry' in s for s in directional_evidence) else 'NO'}")
+            print(f"EMA20_CONTEXT={'YES' if any('ema' in s for s in confirmation_evidence) else 'N/A'}")
+            print(f"RELATIVE_VOLUME={tech_res.get('relative_volume', 'N/A')}")
+            print(f"VOLUME_SPIKE={'YES' if any('volume_spike' in s for s in confirmation_evidence) else 'NO'}")
+            print(f"ATR_PERCENT={tech_res.get('atr_percent', 'N/A')}")
+            print(f"RANGE_POSITION={tech_res.get('range_position', 'N/A')}")
+            print(f"MOMENTUM={tech_res.get('momentum', 'N/A')}")
             print(f"MARKET_STRUCTURE={tech_res.get('market_structure')}")
-            print(f"MTF_ALIGNMENT=N/A")
+            print(f"MTF_ALIGNMENT={tech_res.get('mtf_alignment', 'N/A')}")
             print(f"FUNDAMENTAL_CONTEXT={fund_context}")
             print(f"FUNDAMENTAL_COVERAGE={fund_coverage}")
+            print(f"DIRECTIONAL_EVIDENCE={directional_evidence}")
+            print(f"CONFIRMATION_EVIDENCE={confirmation_evidence}")
+            print(f"CONFLICTING_EVIDENCE={conflicting_evidence}")
             print(f"HOT_WATCHLIST={is_hot}")
             print(f"FULL_ANALYSIS_REASON={'HOT' if is_hot else 'PERIODIC_30M'}")
             print(f"TELEGRAM_ELIGIBLE={telegram_eligible}")
