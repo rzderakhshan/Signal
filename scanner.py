@@ -347,7 +347,7 @@ def main() -> int:
             print("TEST: Telegram connection message would be sent")
             return 0
         try:
-            send_telegram(token, chat_id, "✅ اتصال دیده‌بان بازار به کانال Signal برقرار شد. این پیام آزمایشی است.")
+            send_telegram(token, chat_id, "✅ Signal Scanner Telegram Test\nGitHub connection successful.")
             print("Telegram test message accepted")
             return 0
         except Exception as exc:

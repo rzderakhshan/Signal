@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '*/5 * * * *' # Every 5 minutes, 24/7
   workflow_dispatch: # Manual trigger
+    inputs:
+      test_telegram:
+        description: 'Run connection test (sends 1 Telegram message)'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: scanner-group
@@ -38,7 +44,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scanner.py --github-dry-run
+        run: |
+          if [ "${{ github.event.inputs.test_telegram }}" == "true" ]; then
+            python scanner.py --test-telegram
+          else
+            python scanner.py --github-dry-run
+          fi
 
       - name: Save State (Cache)
         uses: actions/cache/save@v4
