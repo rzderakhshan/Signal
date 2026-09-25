@@ -323,10 +323,11 @@ def format_report(rows: list[MarketRow], profiles: dict[str, dict], now: datetim
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--watchlist", type=Path, default=Path("watchlist.json"))
-    parser.add_argument("--state", type=Path, default=Path("state.json"))
-    parser.add_argument("--research-cache", type=Path, default=Path("research_cache.json"))
+    parser.add_argument("--state", type=Path, default=Path(".state/state.json"))
+    parser.add_argument("--research-cache", type=Path, default=Path(".state/research_cache.json"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--github-dry-run", action="store_true")
     parser.add_argument("--report-now", action="store_true", help="Generate the volatility and fundamental digest now")
     parser.add_argument("--test-telegram", action="store_true", help="Send one harmless connection check")
     args = parser.parse_args()
@@ -367,8 +368,20 @@ def main() -> int:
     now = datetime.now(timezone.utc)
     state = {key: stamp for key, stamp in state.items()
              if isinstance(stamp, (int, float)) and 0 <= now.timestamp() - stamp < 7 * 86400}
-    if not args.dry_run:
-        atomic_json(args.state, state)
+             
+    # Ensure state directory exists
+    if args.state.parent:
+        args.state.parent.mkdir(parents=True, exist_ok=True)
+    if args.research_cache.parent:
+        args.research_cache.parent.mkdir(parents=True, exist_ok=True)
+        
+    is_dry_run = args.dry_run or args.github_dry_run
+        
+    if not is_dry_run:
+        try:
+            atomic_json(args.state, state)
+        except Exception as e:
+            print(f"Warning: Failed to save state: {e}", file=sys.stderr)
     alerts = []
     rows = []
     received_any = False
@@ -412,7 +425,7 @@ def main() -> int:
         if alert.key in state:
             continue
         msg = format_alert(alert, profiles.get(alert.symbol))
-        if args.dry_run:
+        if is_dry_run:
             print(msg)
         else:
             try:
@@ -422,10 +435,13 @@ def main() -> int:
                 print(f"Telegram send failed ({type(exc).__name__}); check bot/channel permissions", file=sys.stderr)
                 return 1
             state[alert.key] = now.timestamp()
-            atomic_json(args.state, state)
+            try:
+                atomic_json(args.state, state)
+            except Exception as e:
+                print(f"Warning: Failed to save state: {e}", file=sys.stderr)
     if report_due and rows:
         message = format_report(rows, profiles, now)
-        if args.dry_run:
+        if is_dry_run:
             print(message)
         else:
             try:
@@ -434,7 +450,10 @@ def main() -> int:
                 print(f"Telegram report failed ({type(exc).__name__}); check bot/channel permissions", file=sys.stderr)
                 return 1
             state[report_key] = now.timestamp()
-            atomic_json(args.state, state)
+            try:
+                atomic_json(args.state, state)
+            except Exception as e:
+                print(f"Warning: Failed to save state: {e}", file=sys.stderr)
     return 0
 
 
