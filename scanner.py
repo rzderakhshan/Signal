@@ -608,7 +608,22 @@ def main() -> int:
             print("---")
             
             if telegram_eligible and not is_dry_run:
-                msg = f"🔥 {stage} | {symbol} | {asset} | Score: {sig_score}/100\nSignals: {', '.join(all_signals)}\nContext: {fund_context}"
+                if stage == "EARLY_WATCH":
+                    stage_icon = "👀"
+                    stage_text = "EARLY WATCH (Developing Setup)"
+                else:
+                    stage_icon = "🔥"
+                    stage_text = "CONFIRMED SETUP"
+                    
+                msg = (
+                    f"{stage_icon} <b>{stage_text} | {symbol} | {asset}</b>\n\n"
+                    f"• Direction: {signal_direction}\n"
+                    f"• Score: {sig_score}/100 (Activity: {activity['score']})\n"
+                    f"• 5m: {tech_res.get('trend_5m', 'N/A')} | 15m: {tech_res.get('trend_15m', 'N/A')} ({tech_res.get('mtf_alignment', 'N/A')})\n"
+                    f"• Relation: {trend_relation}\n"
+                    f"• Reasons: {', '.join(all_signals)}\n"
+                    f"• Context: {fund_context}"
+                )
                 try: send_telegram(token, chat_id, msg)
                 except Exception as e: print(f"Telegram failed: {e}")
                 

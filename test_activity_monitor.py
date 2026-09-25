@@ -49,3 +49,18 @@ def test_alert_gating():
     
     # After cooldown should pass even if same
     assert monitor.should_send_alert("TSLA", signal2, now + timedelta(minutes=60)) == True
+
+def test_stage_aware_dedup():
+    monitor = ActivityMonitor()
+    now = datetime.now()
+    
+    # EARLY_WATCH alert
+    early_signal = {"signals": ["EARLY_WATCH", "volume_spike", "rsi_re_entry_bullish"]}
+    assert monitor.should_send_alert("AAPL", early_signal, now) == True
+    
+    # Same EARLY_WATCH should be blocked
+    assert monitor.should_send_alert("AAPL", early_signal, now + timedelta(minutes=5)) == False
+    
+    # CONFIRMED_SETUP with same underlying signals but new stage
+    confirmed_signal = {"signals": ["CONFIRMED_SETUP", "volume_spike", "rsi_re_entry_bullish"]}
+    assert monitor.should_send_alert("AAPL", confirmed_signal, now + timedelta(minutes=10)) == True
