@@ -33,8 +33,8 @@ def atomic_json(path: Path, data: dict) -> None:
 
 
 class ResearchCache:
-    FUNDAMENTAL_TTL = 24 * 3600
-    NEWS_TTL = 2 * 3600
+    FUNDAMENTAL_TTL = 60 * 60
+    NEWS_TTL = 60 * 60
     STALE_FUNDAMENTAL_MAX = 72 * 3600
 
     def __init__(self, path: Path, ticker_factory=None):

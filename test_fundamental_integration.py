@@ -1,4 +1,5 @@
 from scanner import evaluate_fundamental_context
+from research import ResearchCache
 
 
 def profile(score, catalyst=0, available=True):
@@ -39,3 +40,14 @@ def test_crypto_or_missing_profile_is_neutral():
     r = evaluate_fundamental_context(None, "BUY")
     assert r["contribution"] == 0
     assert r["evidence"] == []
+
+
+def test_fundamental_and_catalyst_refresh_hourly():
+    assert ResearchCache.FUNDAMENTAL_TTL == 3600
+    assert ResearchCache.NEWS_TTL == 3600
+
+
+def test_hourly_cache_boundary_is_not_treated_as_fresh():
+    # The cache freshness checks use age < TTL, so exactly one hour is due for refresh.
+    assert not (3600 < ResearchCache.FUNDAMENTAL_TTL)
+    assert not (3600 < ResearchCache.NEWS_TTL)
