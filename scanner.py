@@ -26,6 +26,7 @@ from research import ResearchCache, atomic_json
 import activity_monitor
 import signal_engine
 from universe import load_instrument_map, load_universe
+from mobile_signal_report import build_mobile_signal_pdf
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -618,6 +619,7 @@ def main() -> int:
     crypto_ranks: list[dict] = []
     stock_ranks: list[dict] = []
     analysis_candidates: list[str] = []
+    report_candidates: list[dict] = []
     unsupported_stock_symbols: list[str] = []
     unsupported_crypto_symbols: list[str] = []
 
@@ -914,6 +916,22 @@ def main() -> int:
             print(f"BLOCK_REASON={block_reason}")
             print("---")
 
+            # Collect compact review candidates for the hourly mobile PDF.
+            # This does not change scoring, stage, or Telegram eligibility.
+            if signal_direction in ("BUY", "SELL") and stage in ("EARLY_WATCH", "CONFIRMED_SETUP"):
+                report_candidates.append({
+                    "symbol": symbol, "asset": asset, "stage": stage, "direction": signal_direction,
+                    "signal_score": sig_score, "activity_score": activity.get("score", 0),
+                    "trend_5m": tech_res.get("trend_5m", "N/A"), "trend_15m": tech_res.get("trend_15m", "N/A"),
+                    "trend_relation": trend_relation, "rsi": tech_res.get("rsi", "N/A"),
+                    "atr_percent": tech_res.get("atr_percent", "N/A"), "relative_volume": tech_res.get("relative_volume", "N/A"),
+                    "market_structure": tech_res.get("market_structure", "N/A"),
+                    "fundamental": fund_context, "coverage": fund_coverage,
+                    "catalyst": (profile.get("catalyst_grade", "N/A") if profile else "N/A"),
+                    "reasons": all_signals, "conflicts": conflicting_evidence,
+                    "closes": [float(x) for x in df_5m["Close"].tail(48).dropna().tolist()],
+                })
+
             if telegram_eligible and not is_dry_run:
                 if stage == "EARLY_WATCH":
                     stage_icon = "👀"
@@ -942,6 +960,33 @@ def main() -> int:
         except Exception as exc:
             print(f"SKIPPED={symbol} reason=full_analysis_{type(exc).__name__}", file=sys.stderr)
             summary["skipped_symbols"] += 1
+
+    # One compact PDF per hour, not one PDF every 5-minute scan.
+    # The report is a review shortlist, never an automated trade instruction.
+    if not is_dry_run and report_candidates:
+        interval_minutes = max(15, int(os.getenv("PDF_REPORT_INTERVAL_MINUTES", "60")))
+        last_pdf_raw = state.get("last_mobile_pdf_report")
+        last_pdf = None
+        try:
+            last_pdf = datetime.fromisoformat(last_pdf_raw) if last_pdf_raw else None
+            if last_pdf and last_pdf.tzinfo is None:
+                last_pdf = last_pdf.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            last_pdf = None
+        due = last_pdf is None or (now - last_pdf).total_seconds() >= interval_minutes * 60
+        if due:
+            try:
+                report_path = str(Path(".state") / "signal_mobile_review.pdf")
+                build_mobile_signal_pdf(report_path, report_candidates, now, max_items=int(os.getenv("PDF_REPORT_MAX_ITEMS", "12")))
+                sent = telegram_utils.send_telegram_document(
+                    report_path,
+                    caption="Signal Scanner - mobile BUY/SELL review shortlist (technical + activity + fundamental context)",
+                )
+                print(f"MOBILE_PDF_REPORT={'SENT' if sent else 'FAILED'} candidates={len(report_candidates)}")
+                if sent:
+                    state["last_mobile_pdf_report"] = now.isoformat()
+            except Exception as exc:
+                print(f"MOBILE_PDF_REPORT=FAILED reason={type(exc).__name__}", file=sys.stderr)
 
     state["hot_watchlist"] = {k: v.timestamp() for k, v in monitor.hot_watchlist.items()}
     state["alert_history"] = {

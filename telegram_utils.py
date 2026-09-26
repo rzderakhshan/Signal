@@ -66,13 +66,20 @@ def send_telegram_document(file_path: str, caption: str = "") -> bool:
     success = True
     for chat_id in chat_ids:
         try:
-            with open(file_path, "rb") as pdf_file:
-                response = requests.post(
-                    url,
-                    data={"chat_id": chat_id, "caption": caption[:1000]},
-                    files={"document": pdf_file},
-                    timeout=60,
-                )
+            def _post_document():
+                with open(file_path, "rb") as pdf_file:
+                    return requests.post(
+                        url,
+                        data={"chat_id": chat_id, "caption": caption[:1000]},
+                        files={"document": pdf_file},
+                        timeout=60,
+                    )
+            response = _post_document()
+            if response.status_code == 429:
+                delay = _retry_after_seconds(response)
+                logging.warning("Telegram document rate limited; retrying once after %ss", delay)
+                time.sleep(delay)
+                response = _post_document()
             if response.status_code != 200:
                 logging.error("Telegram document send failed with HTTP %s", response.status_code)
                 success = False
