@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from activity_monitor import ActivityMonitor
 from scanner import prepare_runtime_state, restore_alert_history, restore_hot_watchlist
@@ -112,3 +113,40 @@ def test_production_workflow_is_live_and_singular():
 
     # Scheduled path must run live production (not only the test-telegram branch).
     assert "else\n            python scanner.py\n          fi" in text.replace("\r\n", "\n")
+
+
+def test_high_activity_path_is_internal_only_in_scanner_source():
+    source = Path("scanner.py").read_text(encoding="utf-8")
+    assert "HIGH_ACTIVITY_INTERNAL=" in source
+    assert "send_telegram(token, chat_id, format_high_activity_message" not in source
+
+
+def test_telegram_429_retries_once_and_respects_retry_after(monkeypatch):
+    import telegram_utils
+    first = MagicMock(status_code=429)
+    first.json.return_value = {"parameters": {"retry_after": 2}}
+    second = MagicMock(status_code=200)
+    post = MagicMock(side_effect=[first, second])
+    sleep = MagicMock()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100123")
+    monkeypatch.setattr(telegram_utils.requests, "post", post)
+    monkeypatch.setattr(telegram_utils.time, "sleep", sleep)
+    assert telegram_utils.send_telegram_message("test") is True
+    assert post.call_count == 2
+    sleep.assert_called_once_with(2)
+
+
+def test_telegram_429_does_not_retry_more_than_once(monkeypatch):
+    import telegram_utils
+    limited1 = MagicMock(status_code=429)
+    limited1.json.return_value = {"parameters": {"retry_after": 1}}
+    limited2 = MagicMock(status_code=429)
+    limited2.json.return_value = {"parameters": {"retry_after": 1}}
+    post = MagicMock(side_effect=[limited1, limited2])
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100123")
+    monkeypatch.setattr(telegram_utils.requests, "post", post)
+    monkeypatch.setattr(telegram_utils.time, "sleep", MagicMock())
+    assert telegram_utils.send_telegram_message("test") is False
+    assert post.call_count == 2

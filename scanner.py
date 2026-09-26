@@ -242,22 +242,63 @@ def fetch_kraken(symbol: str, minutes: int) -> pd.DataFrame:
     return frame
 
 
+def _crypto_usd_fallback(symbol: str) -> str | None:
+    """Return a Yahoo USD fallback for a canonical BASE-EUR crypto symbol."""
+    try:
+        base, quote = symbol.upper().split("-", 1)
+    except ValueError:
+        return None
+    if quote != "EUR" or not base:
+        return None
+    return f"{base}-USD"
+
+
 def fetch(symbols: list[str], minutes: int, crypto_symbols: list[str], yahoo_batch_size: int = 50) -> dict[str, pd.DataFrame]:
-    """Yahoo-first batch fetch; Kraken fills missing crypto only (keeps large universes fast)."""
-    crypto = set(crypto_symbols)
+    """Yahoo canonical -> Yahoo USD fallback -> Kraken canonical; failures stay isolated.
+
+    Returned keys always use the configured canonical symbol. When a fallback feed is
+    used, the actual market-data ticker is recorded in DataFrame.attrs['data_symbol'].
+    """
     result: dict[str, pd.DataFrame] = {}
     if symbols:
         try:
             result.update(fetch_yahoo(symbols, minutes, yahoo_batch_size))
         except Exception as exc:
             print(f"Yahoo {minutes}m unavailable ({type(exc).__name__})", file=sys.stderr)
-    for symbol in crypto_symbols:
-        if symbol in result:
+
+    # Resolve missing crypto efficiently through Yahoo USD pairs in one/bounded batches.
+    fallback_to_canonical: dict[str, str] = {}
+    for canonical in crypto_symbols:
+        if canonical in result:
+            result[canonical].attrs.setdefault("data_symbol", canonical)
+            continue
+        fallback = _crypto_usd_fallback(canonical)
+        if fallback and fallback != canonical:
+            fallback_to_canonical[fallback] = canonical
+    if fallback_to_canonical:
+        try:
+            fallback_frames = fetch_yahoo(list(fallback_to_canonical), minutes, yahoo_batch_size)
+        except Exception as exc:
+            print(f"Yahoo crypto fallback {minutes}m unavailable ({type(exc).__name__})", file=sys.stderr)
+            fallback_frames = {}
+        for data_symbol, frame in fallback_frames.items():
+            canonical = fallback_to_canonical[data_symbol]
+            frame.attrs["data_symbol"] = data_symbol
+            frame.attrs["canonical_symbol"] = canonical
+            frame.attrs["source"] = "Yahoo fallback"
+            result[canonical] = frame
+
+    # Last resort: preserve the configured EUR identity and try Kraken spot.
+    for canonical in crypto_symbols:
+        if canonical in result:
             continue
         try:
-            result[symbol] = fetch_kraken(symbol, minutes)
+            frame = fetch_kraken(canonical, minutes)
+            frame.attrs["data_symbol"] = canonical
+            frame.attrs["canonical_symbol"] = canonical
+            result[canonical] = frame
         except (OSError, ValueError, KeyError, IndexError, TimeoutError) as exc:
-            print(f"SKIPPED={symbol} reason=no_feed ({type(exc).__name__})", file=sys.stderr)
+            print(f"SKIPPED={canonical} reason=no_feed ({type(exc).__name__})", file=sys.stderr)
     return result
 
 
@@ -530,6 +571,7 @@ def main() -> int:
         "confirmed_setups": 0,
         "telegram_eligible": 0,
         "telegram_sent": 0,
+        "telegram_failed": 0,
         "telegram_dedup_blocked": 0,
         "dedup_blocked": 0,
         "stale_or_failed": 0,
@@ -542,6 +584,8 @@ def main() -> int:
     crypto_ranks: list[dict] = []
     stock_ranks: list[dict] = []
     analysis_candidates: list[str] = []
+    unsupported_stock_symbols: list[str] = []
+    unsupported_crypto_symbols: list[str] = []
 
     for symbol in universe:
         asset = asset_of.get(symbol, "stocks")
@@ -551,6 +595,7 @@ def main() -> int:
                 summary["skipped_symbols"] += 1
                 summary["stale_or_failed"] += 1
                 summary["crypto_data_failed" if asset == "crypto" else "stock_data_failed"] += 1
+                (unsupported_crypto_symbols if asset == "crypto" else unsupported_stock_symbols).append(symbol)
                 continue
 
             df_5m = closed_bars(data_5m[symbol], 5, now)
@@ -565,6 +610,9 @@ def main() -> int:
             summary["fresh_symbols"] += 1
             if asset == "crypto":
                 summary["crypto_data_valid"] += 1
+                data_symbol = str(data_5m[symbol].attrs.get("data_symbol", symbol))
+                if data_symbol != symbol:
+                    print(f"CRYPTO_DATA_SYMBOL={symbol}->{data_symbol}")
             else:
                 summary["stock_data_valid"] += 1
 
@@ -585,26 +633,15 @@ def main() -> int:
             else:
                 stock_ranks.append(row)
 
-            # Informational HIGH ACTIVITY (independent of Signal Engine / BUY-SELL)
+            # HIGH ACTIVITY is discovery-only. It promotes/ranks the Hot Watchlist,
+            # but it must never consume Telegram dedup state or send a message.
             if monitor.is_high_activity(activity):
                 summary["high_activity_events"] += 1
-                payload = {"signals": ["HIGH_ACTIVITY"] + list(activity.get("events") or [])}
-                if monitor.should_send_alert(symbol, payload, now):
-                    summary["telegram_eligible"] += 1
-                    print(
-                        f"HIGH_ACTIVITY={symbol} score={activity.get('score')} "
-                        f"rel_vol={activity.get('metrics', {}).get('relative_volume')} "
-                        f"move={activity.get('metrics', {}).get('move_pct')}"
-                    )
-                    if not is_dry_run:
-                        try:
-                            send_telegram(token, chat_id, format_high_activity_message(symbol, asset, activity))
-                            summary["telegram_sent"] += 1
-                        except Exception as exc:
-                            print(f"Telegram failed ({type(exc).__name__}): HIGH_ACTIVITY {symbol}", file=sys.stderr)
-                else:
-                    summary["telegram_dedup_blocked"] += 1
-                    summary["dedup_blocked"] += 1
+                print(
+                    f"HIGH_ACTIVITY_INTERNAL={symbol} score={activity.get('score')} "
+                    f"rel_vol={activity.get('metrics', {}).get('relative_volume')} "
+                    f"move={activity.get('metrics', {}).get('move_pct')}"
+                )
 
             if is_hot:
                 analysis_candidates.append(symbol)
@@ -859,7 +896,8 @@ def main() -> int:
                     send_telegram(token, chat_id, msg)
                     summary["telegram_sent"] += 1
                 except Exception as e:
-                    print(f"Telegram failed: {e}")
+                    summary["telegram_failed"] += 1
+                    print(f"Telegram failed ({type(e).__name__}): {symbol}", file=sys.stderr)
         except Exception as exc:
             print(f"SKIPPED={symbol} reason=full_analysis_{type(exc).__name__}", file=sys.stderr)
             summary["skipped_symbols"] += 1
@@ -877,6 +915,14 @@ def main() -> int:
             print(f"Warning: Failed to save state: {e}", file=sys.stderr)
 
     print("RUN_SUMMARY")
+    print(f"configured_stocks={summary['stock_universe_size']}")
+    print(f"configured_crypto={summary['crypto_universe_size']}")
+    print(f"valid_stock_data={summary['stock_data_valid']}")
+    print(f"valid_crypto_data={summary['crypto_data_valid']}")
+    print(f"unsupported_stock_symbols={','.join(unsupported_stock_symbols) if unsupported_stock_symbols else 'NONE'}")
+    print(f"unsupported_crypto_symbols={','.join(unsupported_crypto_symbols) if unsupported_crypto_symbols else 'NONE'}")
+    print(f"high_activity_internal={summary['high_activity_events']}")
+    print(f"confirmed_setup={summary['confirmed_setups']}")
     for k, v in summary.items():
         print(f"{k}={v}")
 

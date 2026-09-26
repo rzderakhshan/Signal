@@ -52,13 +52,16 @@ def test_instrument_map_optional_and_nonblocking():
     assert load_instrument_map(Path("does_not_exist.json")) == {}
 
 
-def test_unsupported_symbol_safely_skipped():
+def test_unsupported_symbol_safely_skipped(monkeypatch):
+    import sys
+    import types
     from scanner import fetch_yahoo
 
-    with patch("yfinance.download", return_value=pd.DataFrame()):
-        # Empty / missing symbols must not raise.
-        result = fetch_yahoo(["NOTAREALCOIN-EUR", "ALSOFAKE-EUR"], 5)
-        assert isinstance(result, dict)
+    fake_yf = types.SimpleNamespace(download=MagicMock(return_value=pd.DataFrame()))
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+    # Empty / missing symbols must not raise.
+    result = fetch_yahoo(["NOTAREALCOIN-EUR", "ALSOFAKE-EUR"], 5)
+    assert isinstance(result, dict)
 
 
 def test_high_activity_enters_hot_watchlist():
@@ -198,3 +201,31 @@ def test_activity_threshold_is_configurable():
     assert monitor.is_hot("MID") is False
     monitor.update_hot_watchlist("HOT", {"score": 70, "events": [], "metrics": {}}, now)
     assert monitor.is_hot("HOT") is True
+
+
+def test_crypto_eur_fallback_resolves_to_usd_without_changing_canonical_key():
+    from scanner import fetch
+    eur = pd.DataFrame()
+    usd = _active_df()
+
+    def fake_yahoo(symbols, minutes, batch_size=50):
+        if "TEST-EUR" in symbols:
+            return {}
+        if "TEST-USD" in symbols:
+            frame = usd.copy()
+            frame.attrs["source"] = "Yahoo"
+            return {"TEST-USD": frame}
+        return {}
+
+    with patch("scanner.fetch_yahoo", side_effect=fake_yahoo), patch("scanner.fetch_kraken") as kraken:
+        result = fetch(["TEST-EUR"], 5, ["TEST-EUR"])
+    assert "TEST-EUR" in result
+    assert "TEST-USD" not in result
+    assert result["TEST-EUR"].attrs["data_symbol"] == "TEST-USD"
+    kraken.assert_not_called()
+
+
+def test_unsupported_crypto_is_safely_skipped_after_all_fallbacks_fail():
+    from scanner import fetch
+    with patch("scanner.fetch_yahoo", return_value={}), patch("scanner.fetch_kraken", side_effect=ValueError("no pair")):
+        assert fetch(["NOPE-EUR"], 5, ["NOPE-EUR"]) == {}
