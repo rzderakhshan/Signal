@@ -25,6 +25,7 @@ import telegram_utils
 from research import ResearchCache, atomic_json
 import activity_monitor
 import signal_engine
+from universe import load_instrument_map, load_universe
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -190,22 +191,33 @@ def market_row(frame: pd.DataFrame, symbol: str, asset: str, minutes: int, now: 
                      float(close.iloc[-1]), round(atr, 2), round(width, 2), round(pos, 2), volume_ratio, score, source)
 
 
-def fetch_yahoo(symbols: list[str], minutes: int) -> dict[str, pd.DataFrame]:
+def fetch_yahoo(symbols: list[str], minutes: int, batch_size: int = 50) -> dict[str, pd.DataFrame]:
+    """Fetch Yahoo intraday data in bounded batches so 250+ symbol universes stay reliable."""
     import yfinance as yf
 
     if not symbols:
         return {}
-    data = yf.download(symbols, period="10d", interval=f"{minutes}m", group_by="ticker", auto_adjust=False, threads=False, progress=False, timeout=20)
-    result = {}
-    for symbol in symbols:
+    batch_size = max(1, min(100, int(batch_size)))
+    result: dict[str, pd.DataFrame] = {}
+    for start in range(0, len(symbols), batch_size):
+        batch = symbols[start:start + batch_size]
         try:
-            part = data[symbol] if isinstance(data.columns, pd.MultiIndex) else data
-            part = part.dropna(subset=["Open", "High", "Low", "Close"])
-            if not part.empty:
-                part.attrs["source"] = "Yahoo"
-                result[symbol] = part
-        except (KeyError, TypeError):
-            pass
+            data = yf.download(
+                batch, period="10d", interval=f"{minutes}m", group_by="ticker",
+                auto_adjust=False, threads=True, progress=False, timeout=25,
+            )
+        except Exception as exc:
+            print(f"Yahoo batch {start // batch_size + 1} failed ({type(exc).__name__})", file=sys.stderr)
+            continue
+        for symbol in batch:
+            try:
+                part = data[symbol] if isinstance(data.columns, pd.MultiIndex) else data
+                part = part.dropna(subset=["Open", "High", "Low", "Close"])
+                if not part.empty:
+                    part.attrs["source"] = "Yahoo"
+                    result[symbol] = part
+            except (KeyError, TypeError):
+                continue
     return result
 
 
@@ -230,24 +242,44 @@ def fetch_kraken(symbol: str, minutes: int) -> pd.DataFrame:
     return frame
 
 
-def fetch(symbols: list[str], minutes: int, crypto_symbols: list[str]) -> dict[str, pd.DataFrame]:
+def fetch(symbols: list[str], minutes: int, crypto_symbols: list[str], yahoo_batch_size: int = 50) -> dict[str, pd.DataFrame]:
+    """Yahoo-first batch fetch; Kraken fills missing crypto only (keeps large universes fast)."""
     crypto = set(crypto_symbols)
-    result = {}
-    failed_crypto = []
-    for symbol in symbols:
-        if symbol not in crypto:
+    result: dict[str, pd.DataFrame] = {}
+    if symbols:
+        try:
+            result.update(fetch_yahoo(symbols, minutes, yahoo_batch_size))
+        except Exception as exc:
+            print(f"Yahoo {minutes}m unavailable ({type(exc).__name__})", file=sys.stderr)
+    for symbol in crypto_symbols:
+        if symbol in result:
             continue
         try:
             result[symbol] = fetch_kraken(symbol, minutes)
-        except (OSError, ValueError, KeyError, IndexError):
-            failed_crypto.append(symbol)
-    yahoo_symbols = [symbol for symbol in symbols if symbol not in crypto] + failed_crypto
-    if yahoo_symbols:
-        try:
-            result.update(fetch_yahoo(yahoo_symbols, minutes))
-        except Exception as exc:
-            print(f"Yahoo {minutes}m unavailable ({type(exc).__name__})", file=sys.stderr)
+        except (OSError, ValueError, KeyError, IndexError, TimeoutError) as exc:
+            print(f"SKIPPED={symbol} reason=no_feed ({type(exc).__name__})", file=sys.stderr)
     return result
+
+
+def format_high_activity_message(symbol: str, asset: str, activity: dict) -> str:
+    metrics = activity.get("metrics") or {}
+    move = float(metrics.get("move_pct") or 0)
+    move_txt = f"{move:+.2f}%"
+    rel = float(metrics.get("relative_volume") or 0)
+    atr = float(metrics.get("atr_percent") or 0)
+    return (
+        f"⚡ <b>HIGH ACTIVITY</b>\n\n"
+        f"Symbol: {symbol}\n"
+        f"Asset: {asset.capitalize() if asset != 'crypto' else 'Crypto'}\n\n"
+        f"Activity Score: {int(activity.get('score', 0))}/100\n"
+        f"5m Move: {move_txt}\n"
+        f"Relative Volume: {rel:.1f}x\n"
+        f"ATR: {atr:.2f}%\n\n"
+        f"Status:\n"
+        f"High volatility / unusual market activity detected.\n\n"
+        f"⚠️ This is NOT a BUY/SELL signal.\n"
+        f"Waiting for directional confirmation."
+    )
 
 
 def send_telegram(token: str, chat_id: str, msg: str) -> None:
@@ -322,7 +354,7 @@ def format_report(rows: list[MarketRow], profiles: dict[str, dict], now: datetim
     return "\n".join(lines)[:4000]
 
 
-STRUCTURED_STATE_KEYS = frozenset({"hot_watchlist", "alert_history", "last_30m_scan"})
+STRUCTURED_STATE_KEYS = frozenset({"hot_watchlist", "alert_history", "last_30m_scan", "safety_stock_cursor", "safety_crypto_cursor"})
 
 
 def prepare_runtime_state(raw_state: dict, now: datetime) -> dict:
@@ -333,6 +365,8 @@ def prepare_runtime_state(raw_state: dict, now: datetime) -> dict:
     hot = raw_state.get("hot_watchlist") if isinstance(raw_state.get("hot_watchlist"), dict) else {}
     alerts = raw_state.get("alert_history") if isinstance(raw_state.get("alert_history"), dict) else {}
     last_30m = raw_state.get("last_30m_scan")
+    safety_stock_cursor = raw_state.get("safety_stock_cursor", 0)
+    safety_crypto_cursor = raw_state.get("safety_crypto_cursor", 0)
 
     cleaned = {
         key: stamp
@@ -345,6 +379,10 @@ def prepare_runtime_state(raw_state: dict, now: datetime) -> dict:
     cleaned["alert_history"] = alerts
     if isinstance(last_30m, (int, float)):
         cleaned["last_30m_scan"] = last_30m
+    if isinstance(safety_stock_cursor, (int, float)):
+        cleaned["safety_stock_cursor"] = int(safety_stock_cursor)
+    if isinstance(safety_crypto_cursor, (int, float)):
+        cleaned["safety_crypto_cursor"] = int(safety_crypto_cursor)
     return cleaned
 
 
@@ -385,6 +423,8 @@ def restore_hot_watchlist(raw: object, current_ts: float) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--watchlist", type=Path, default=Path("watchlist.json"))
+    parser.add_argument("--universe", type=Path, default=Path("universe.json"),
+                        help="Discovery universe JSON (stocks/crypto). Falls back to --watchlist.")
     parser.add_argument("--state", type=Path, default=Path(".state/state.json"))
     parser.add_argument("--research-cache", type=Path, default=Path(".state/research_cache.json"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
@@ -414,16 +454,22 @@ def main() -> int:
             print(f"Telegram test failed ({type(exc).__name__}); check bot/channel permissions", file=sys.stderr)
             return 1
     try:
-        watchlist = json.loads(args.watchlist.read_text(encoding="utf-8"))
-        symbols = {asset: list(dict.fromkeys(str(s).strip().upper() for s in watchlist.get(asset, []) if str(s).strip()))
-                   for asset in ("stocks", "crypto")}
-        if not symbols["stocks"] and not symbols["crypto"]:
-            raise ValueError("watchlist is empty")
-        if len(symbols["stocks"] + symbols["crypto"]) > 40:
-            raise ValueError("limit the watchlist to 40 symbols to reduce source throttling")
+        universe_path = args.universe if args.universe.exists() else args.watchlist
+        symbols = load_universe(universe_path)
     except (OSError, ValueError, TypeError) as exc:
-        print(f"Invalid watchlist: {exc}", file=sys.stderr)
+        print(f"Invalid universe/watchlist: {exc}", file=sys.stderr)
         return 2
+    # Optional broker metadata (Yahoo symbol != Trade Republic availability).
+    load_instrument_map()
+    settings = symbols.get("settings", {}) if isinstance(symbols.get("settings", {}), dict) else {}
+    max_hot_stocks = max(1, int(settings.get("max_hot_stocks", 30)))
+    max_hot_crypto = max(1, int(settings.get("max_hot_crypto", 15)))
+    activity_threshold = max(0, min(100, int(settings.get("activity_threshold", 40))))
+    safety_stock_batch = max(0, int(settings.get("safety_stock_batch", 50)))
+    safety_crypto_batch = max(0, int(settings.get("safety_crypto_batch", 20)))
+    yahoo_batch_size = max(1, min(100, int(settings.get("yahoo_batch_size", 50))))
+    top_activity_limit = max(1, int(settings.get("top_activity_limit", 10)))
+
     try:
         state = json.loads(args.state.read_text(encoding="utf-8")) if args.state.exists() else {}
         if not isinstance(state, dict):
@@ -437,113 +483,247 @@ def main() -> int:
     if args.state.parent: args.state.parent.mkdir(parents=True, exist_ok=True)
     if args.research_cache.parent: args.research_cache.parent.mkdir(parents=True, exist_ok=True)
 
-    monitor = activity_monitor.ActivityMonitor()
+    monitor = activity_monitor.ActivityMonitor(activity_threshold=activity_threshold)
     current_ts = now.timestamp()
     monitor.hot_watchlist = restore_hot_watchlist(state.get("hot_watchlist", {}), current_ts)
     monitor.alert_history = restore_alert_history(state.get("alert_history", {}))
     
     universe = list(dict.fromkeys(symbols["stocks"] + symbols["crypto"]))
-    data_5m = {}
-    data_15m = {}
-    
+    asset_of = {s: "crypto" for s in symbols["crypto"]}
+    asset_of.update({s: "stocks" for s in symbols["stocks"]})
+
+    data_5m: dict = {}
     try:
-        data_5m = fetch(universe, 5, symbols["crypto"])
+        data_5m = fetch(universe, 5, symbols["crypto"], yahoo_batch_size)
     except Exception as exc:
         print(f"5m feed error ({type(exc).__name__})", file=sys.stderr)
-    try:
-        data_15m = fetch(universe, 15, symbols["crypto"])
-    except Exception as exc:
-        print(f"15m feed error ({type(exc).__name__})", file=sys.stderr)
-        
+
     if not data_5m:
         print("No market data received; check Yahoo availability and ticker spelling", file=sys.stderr)
         return 1
-        
+
     cache = ResearchCache(args.research_cache)
-    
+
     last_30m = state.get("last_30m_scan", 0)
     is_periodic_30m = (now.timestamp() - last_30m) > 1800
-    if is_periodic_30m: state["last_30m_scan"] = now.timestamp()
+    if is_periodic_30m:
+        state["last_30m_scan"] = now.timestamp()
 
     summary = {
-        "symbols_scanned": len(data_5m),
+        "crypto_universe_size": len(symbols["crypto"]),
+        "stock_universe_size": len(symbols["stocks"]),
+        "crypto_data_valid": 0,
+        "stock_data_valid": 0,
+        "stock_data_failed": 0,
+        "crypto_data_failed": 0,
+        "symbols_scanned": 0,
         "fresh_symbols": 0,
+        "hot_crypto": 0,
+        "hot_stocks": 0,
         "hot_symbols": 0,
         "full_analysis_count": 0,
+        "full_stock_analysis_count": 0,
+        "full_crypto_analysis_count": 0,
+        "high_activity_events": 0,
         "internal_candidates": 0,
         "early_watch": 0,
         "confirmed_setups": 0,
         "telegram_eligible": 0,
+        "telegram_sent": 0,
+        "telegram_dedup_blocked": 0,
         "dedup_blocked": 0,
-        "stale_or_failed": len(universe) - len(data_5m)
+        "stale_or_failed": 0,
+        "skipped_symbols": 0,
+        "periodic_30m": int(is_periodic_30m),
     }
 
-    for asset, names in symbols.items():
-        for symbol in names:
-            if symbol not in data_5m: continue
-            
+    # ---------- Phase 1: Fast Activity Scan across discovery universe ----------
+    activity_by_symbol: dict[str, dict] = {}
+    crypto_ranks: list[dict] = []
+    stock_ranks: list[dict] = []
+    analysis_candidates: list[str] = []
+
+    for symbol in universe:
+        asset = asset_of.get(symbol, "stocks")
+        try:
+            if symbol not in data_5m:
+                print(f"SKIPPED={symbol} reason=unsupported_or_missing")
+                summary["skipped_symbols"] += 1
+                summary["stale_or_failed"] += 1
+                summary["crypto_data_failed" if asset == "crypto" else "stock_data_failed"] += 1
+                continue
+
             df_5m = closed_bars(data_5m[symbol], 5, now)
             if df_5m.empty or len(df_5m) < 50:
+                print(f"SKIPPED={symbol} reason=stale_or_short")
+                summary["skipped_symbols"] += 1
                 summary["stale_or_failed"] += 1
+                summary["crypto_data_failed" if asset == "crypto" else "stock_data_failed"] += 1
                 continue
-            
+
+            summary["symbols_scanned"] += 1
             summary["fresh_symbols"] += 1
-            
-            # Fast Activity Scan
+            if asset == "crypto":
+                summary["crypto_data_valid"] += 1
+            else:
+                summary["stock_data_valid"] += 1
+
             activity = monitor.calc_activity_score(df_5m)
+            activity_by_symbol[symbol] = activity
             monitor.update_hot_watchlist(symbol, activity, now)
             is_hot = monitor.is_hot(symbol)
-            if is_hot: summary["hot_symbols"] += 1
-            
-            # Gating for Full Analysis
-            if not is_hot and not is_periodic_30m:
+            if is_hot:
+                summary["hot_symbols"] += 1
+                if asset == "crypto":
+                    summary["hot_crypto"] += 1
+                else:
+                    summary["hot_stocks"] += 1
+
+            row = {"symbol": symbol, "asset": asset, "score": int(activity.get("score", 0))}
+            if asset == "crypto":
+                crypto_ranks.append(row)
+            else:
+                stock_ranks.append(row)
+
+            # Informational HIGH ACTIVITY (independent of Signal Engine / BUY-SELL)
+            if monitor.is_high_activity(activity):
+                summary["high_activity_events"] += 1
+                payload = {"signals": ["HIGH_ACTIVITY"] + list(activity.get("events") or [])}
+                if monitor.should_send_alert(symbol, payload, now):
+                    summary["telegram_eligible"] += 1
+                    print(
+                        f"HIGH_ACTIVITY={symbol} score={activity.get('score')} "
+                        f"rel_vol={activity.get('metrics', {}).get('relative_volume')} "
+                        f"move={activity.get('metrics', {}).get('move_pct')}"
+                    )
+                    if not is_dry_run:
+                        try:
+                            send_telegram(token, chat_id, format_high_activity_message(symbol, asset, activity))
+                            summary["telegram_sent"] += 1
+                        except Exception as exc:
+                            print(f"Telegram failed ({type(exc).__name__}): HIGH_ACTIVITY {symbol}", file=sys.stderr)
+                else:
+                    summary["telegram_dedup_blocked"] += 1
+                    summary["dedup_blocked"] += 1
+
+            if is_hot:
+                analysis_candidates.append(symbol)
+        except Exception as exc:
+            print(f"SKIPPED={symbol} reason={type(exc).__name__}", file=sys.stderr)
+            summary["skipped_symbols"] += 1
+            summary["stale_or_failed"] += 1
+            summary["crypto_data_failed" if asset == "crypto" else "stock_data_failed"] += 1
+
+    top_crypto = activity_monitor.rank_activity(crypto_ranks, limit=top_activity_limit)
+    top_stocks = activity_monitor.rank_activity(stock_ranks, limit=top_activity_limit)
+    print(activity_monitor.format_top_activity("TOP_CRYPTO_ACTIVITY", top_crypto))
+    print(activity_monitor.format_top_activity("TOP_STOCK_ACTIVITY", top_stocks))
+
+    # Stable priority: highest activity first. Limit expensive full analysis independently
+    # from universe size, then add a rotating 30-minute safety batch so quiet symbols are
+    # eventually revisited without analyzing 250+ stocks at once.
+    hot_stocks = [s for s in analysis_candidates if asset_of.get(s) == "stocks"]
+    hot_crypto = [s for s in analysis_candidates if asset_of.get(s) == "crypto"]
+    hot_stocks.sort(key=lambda s: -int(activity_by_symbol.get(s, {}).get("score", 0)))
+    hot_crypto.sort(key=lambda s: -int(activity_by_symbol.get(s, {}).get("score", 0)))
+    analysis_candidates = hot_stocks[:max_hot_stocks] + hot_crypto[:max_hot_crypto]
+
+    if is_periodic_30m:
+        def rotating_batch(pool: list[str], cursor_key: str, size: int) -> list[str]:
+            valid = [s for s in pool if s in activity_by_symbol]
+            if not valid or size <= 0:
+                return []
+            start = int(state.get(cursor_key, 0) or 0) % len(valid)
+            count = min(size, len(valid))
+            chosen = [valid[(start + i) % len(valid)] for i in range(count)]
+            state[cursor_key] = (start + count) % len(valid)
+            return chosen
+
+        analysis_candidates.extend(rotating_batch(symbols["stocks"], "safety_stock_cursor", safety_stock_batch))
+        analysis_candidates.extend(rotating_batch(symbols["crypto"], "safety_crypto_cursor", safety_crypto_batch))
+
+    analysis_candidates = list(dict.fromkeys(analysis_candidates))
+    analysis_candidates.sort(key=lambda s: -int(activity_by_symbol.get(s, {}).get("score", 0)))
+    print(f"FULL_ANALYSIS_PLAN stocks={sum(asset_of.get(s) == 'stocks' for s in analysis_candidates)} "
+          f"crypto={sum(asset_of.get(s) == 'crypto' for s in analysis_candidates)} "
+          f"periodic={int(is_periodic_30m)}")
+
+    # ---------- Phase 2: Full Signal Analysis only for Hot / rotating safety batch ----------
+    data_15m: dict = {}
+    if analysis_candidates:
+        try:
+            data_15m = fetch(analysis_candidates, 15, [s for s in analysis_candidates if asset_of.get(s) == "crypto"], yahoo_batch_size)
+        except Exception as exc:
+            print(f"15m feed error ({type(exc).__name__})", file=sys.stderr)
+
+    for symbol in analysis_candidates:
+        asset = asset_of.get(symbol, "stocks")
+        try:
+            if symbol not in data_5m:
                 continue
-                
+            df_5m = closed_bars(data_5m[symbol], 5, now)
+            if df_5m.empty or len(df_5m) < 50:
+                continue
+
+            activity = activity_by_symbol.get(symbol) or monitor.calc_activity_score(df_5m)
+            is_hot = monitor.is_hot(symbol)
             summary["full_analysis_count"] += 1
+            summary["full_crypto_analysis_count" if asset == "crypto" else "full_stock_analysis_count"] += 1
             df_15m = closed_bars(data_15m[symbol], 15, now) if symbol in data_15m else None
-            
+
             early_res = signal_engine.detect_early_watch(df_5m, df_15m)
             tech_res = signal_engine.calculate_technical_score(df_5m, df_15m)
-            
+
             fund_score_contrib = 0
             fund_context = "N/A"
             fund_coverage = "N/A"
             if asset == "stocks":
                 profile = cache.stock(symbol, now)
-                if profile.get("available"): 
-                    f_score = profile.get('score', 0)
+                if profile.get("available"):
+                    f_score = profile.get("score", 0)
                     fund_context = f"Score: {f_score}/100"
                     fund_coverage = f"{profile.get('coverage')}%"
-                    if f_score > 60: fund_score_contrib += 10
-                    elif f_score < 40: fund_score_contrib -= 10
-                else: 
+                    if f_score > 60:
+                        fund_score_contrib += 10
+                    elif f_score < 40:
+                        fund_score_contrib -= 10
+                else:
                     fund_context = "Fundamentals Missing"
                     fund_coverage = "0%"
-            
+
             sig_score = max(0, min(100, tech_res["technical_score"] + fund_score_contrib))
             all_signals = list(set(early_res.get("signals", []) + tech_res.get("signals", [])))
-            
-            # Simulate legacy detect append
+
             legacy_alerts = detect(data_5m[symbol], symbol, asset, 5, now)
             has_legacy_divergence = False
             legacy_diagnostics = []
             for alert in legacy_alerts:
                 has_legacy_divergence = True
-                diag = f"legacy_divergence_{alert.side}"
-                legacy_diagnostics.append(diag)
-                
-            directional_evidence = [s for s in all_signals if any(k in s for k in ["rsi_turn", "re_entry", "divergence"]) and not s.startswith("legacy_")]
+                legacy_diagnostics.append(f"legacy_divergence_{alert.side}")
+
+            directional_evidence = [
+                s for s in all_signals
+                if any(k in s for k in ["rsi_turn", "re_entry", "divergence"]) and not s.startswith("legacy_")
+            ]
             has_directional = len(directional_evidence) > 0
-            
-            # Extract direction
-            bullish_evidence = [s for s in all_signals if any(k in s for k in ["bullish", "up", "buy"]) and not s.startswith("legacy_")]
-            bearish_evidence = [s for s in all_signals if any(k in s for k in ["bearish", "down", "sell"]) and not s.startswith("legacy_")]
-            
+
+            bullish_evidence = [
+                s for s in all_signals
+                if any(k in s for k in ["bullish", "up", "buy"]) and not s.startswith("legacy_")
+            ]
+            bearish_evidence = [
+                s for s in all_signals
+                if any(k in s for k in ["bearish", "down", "sell"]) and not s.startswith("legacy_")
+            ]
+
             signal_direction = "NEUTRAL"
-            if bullish_evidence and not bearish_evidence: signal_direction = "BUY"
-            elif bearish_evidence and not bullish_evidence: signal_direction = "SELL"
-            elif bullish_evidence and bearish_evidence: signal_direction = "CONFLICTED"
-            
+            if bullish_evidence and not bearish_evidence:
+                signal_direction = "BUY"
+            elif bearish_evidence and not bullish_evidence:
+                signal_direction = "SELL"
+            elif bullish_evidence and bearish_evidence:
+                signal_direction = "CONFLICTED"
+
             conflicting_evidence = []
             if signal_direction == "CONFLICTED":
                 conflicting_evidence = bullish_evidence + bearish_evidence
@@ -551,41 +731,36 @@ def main() -> int:
                 conflicting_evidence.append("15m Trend is Bearish while signal is BUY")
             elif signal_direction == "SELL" and tech_res.get("trend_15m") == "Bullish":
                 conflicting_evidence.append("15m Trend is Bullish while signal is SELL")
-                
+
             trend_relation = "NEUTRAL"
             if signal_direction == "BUY":
                 trend_relation = "WITH_TREND" if tech_res.get("trend_15m") == "Bullish" else "COUNTER_TREND"
             elif signal_direction == "SELL":
                 trend_relation = "WITH_TREND" if tech_res.get("trend_15m") == "Bearish" else "COUNTER_TREND"
-            
-            # Stage Classification
+
             stage = "NONE"
             telegram_eligible = False
             block_reason = "NONE"
-            
-            # Start with base evaluations
+
             if early_res.get("status") == "EARLY WATCH":
                 stage = "EARLY_WATCH"
-            
-            # CONFIRMED_SETUP takes precedence if score is high and it has directional evidence
-            # Requires multi-factor confluence
-            confirmation_evidence = [s for s in all_signals if s not in directional_evidence and not s.startswith("legacy_")]
+
+            confirmation_evidence = [
+                s for s in all_signals if s not in directional_evidence and not s.startswith("legacy_")
+            ]
             has_confirmation = len(confirmation_evidence) > 0
-            
+
             if sig_score >= 60 and has_directional and has_confirmation:
                 stage = "CONFIRMED_SETUP"
-                
-            # Legacy divergence isolation
-            # If ONLY legacy divergence exists and no new engine stage was assigned, it forces INTERNAL_ONLY
+
             if has_legacy_divergence and stage == "NONE":
                 stage = "INTERNAL_ONLY"
             elif has_legacy_divergence and not has_directional:
-                # Override to INTERNAL_ONLY if legacy was trying to ride on high score without direction
                 stage = "INTERNAL_ONLY"
-                
-            if stage == "NONE": continue
-            
-            # Telegram Eligibility (independent of stage)
+
+            if stage == "NONE":
+                continue
+
             if signal_direction in ("NEUTRAL", "CONFLICTED"):
                 telegram_eligible = False
                 block_reason = f"Direction is {signal_direction}"
@@ -604,24 +779,25 @@ def main() -> int:
                     block_reason = "CONFIRMED_SETUP lacks score, direction, or confirmation"
             elif stage == "INTERNAL_ONLY":
                 block_reason = "INTERNAL_ONLY not eligible"
-                
+
             if stage == "INTERNAL_ONLY":
                 summary["internal_candidates"] += 1
             elif stage == "EARLY_WATCH":
                 summary["early_watch"] += 1
             elif stage == "CONFIRMED_SETUP":
                 summary["confirmed_setups"] += 1
-                
-            # Dedup & Alert Gating
+
             if telegram_eligible:
                 payload = {"signals": [stage] + all_signals}
                 if not monitor.should_send_alert(symbol, payload, now):
                     telegram_eligible = False
                     block_reason = "DEDUP_BLOCKED"
                     summary["dedup_blocked"] += 1
-                    
-            if telegram_eligible: summary["telegram_eligible"] += 1
-            
+                    summary["telegram_dedup_blocked"] += 1
+
+            if telegram_eligible:
+                summary["telegram_eligible"] += 1
+
             print(f"SYMBOL={symbol}")
             print(f"ASSET_TYPE={asset}")
             print(f"EVENT_STAGE={stage}")
@@ -661,7 +837,7 @@ def main() -> int:
             print(f"REASONS={all_signals}")
             print(f"BLOCK_REASON={block_reason}")
             print("---")
-            
+
             if telegram_eligible and not is_dry_run:
                 if stage == "EARLY_WATCH":
                     stage_icon = "👀"
@@ -669,7 +845,7 @@ def main() -> int:
                 else:
                     stage_icon = "🔥"
                     stage_text = "CONFIRMED SETUP"
-                    
+
                 msg = (
                     f"{stage_icon} <b>{stage_text} | {symbol} | {asset}</b>\n\n"
                     f"• Direction: {signal_direction}\n"
@@ -679,19 +855,31 @@ def main() -> int:
                     f"• Reasons: {', '.join(all_signals)}\n"
                     f"• Context: {fund_context}"
                 )
-                try: send_telegram(token, chat_id, msg)
-                except Exception as e: print(f"Telegram failed: {e}")
-                
+                try:
+                    send_telegram(token, chat_id, msg)
+                    summary["telegram_sent"] += 1
+                except Exception as e:
+                    print(f"Telegram failed: {e}")
+        except Exception as exc:
+            print(f"SKIPPED={symbol} reason=full_analysis_{type(exc).__name__}", file=sys.stderr)
+            summary["skipped_symbols"] += 1
+
     state["hot_watchlist"] = {k: v.timestamp() for k, v in monitor.hot_watchlist.items()}
-    state["alert_history"] = {k: {'time': v['time'].timestamp(), 'signals': v['signals']} for k, v in monitor.alert_history.items()}
-    
+    state["alert_history"] = {
+        k: {"time": v["time"].timestamp(), "signals": v["signals"]}
+        for k, v in monitor.alert_history.items()
+    }
+
     if not is_dry_run:
-        try: atomic_json(args.state, state)
-        except Exception as e: print(f"Warning: Failed to save state: {e}", file=sys.stderr)
-        
+        try:
+            atomic_json(args.state, state)
+        except Exception as e:
+            print(f"Warning: Failed to save state: {e}", file=sys.stderr)
+
     print("RUN_SUMMARY")
-    for k, v in summary.items(): print(f"{k}={v}")
-    
+    for k, v in summary.items():
+        print(f"{k}={v}")
+
     return 0
 
 if __name__ == "__main__":

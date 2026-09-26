@@ -17,7 +17,7 @@ def test_dry_run_no_credentials():
     if "TELEGRAM_CHAT_ID" in env: del env["TELEGRAM_CHAT_ID"]
     if "SIGNAL_CHAT_ID" in env: del env["SIGNAL_CHAT_ID"]
     
-    code, out, err = run_scanner(["--github-dry-run"], env)
+    code, out, err = run_scanner(["--test-telegram", "--dry-run"], env)
     assert code != 2
     assert "Configure TELEGRAM_BOT_TOKEN" not in err
 
@@ -36,7 +36,7 @@ def test_production_with_credentials_starts():
     env["TELEGRAM_BOT_TOKEN"] = "mock_token"
     env["TELEGRAM_CHAT_ID"] = "mock_id"
     
-    code, out, err = run_scanner([], env)
-    # Should not fail due to missing credentials. Might fail due to no data (exit code 1)
+    code, out, err = run_scanner(["--test-telegram", "--dry-run"], env)
+    # Credential wiring can start without touching market data or Telegram network.
     assert code != 2
     assert "Configure TELEGRAM_BOT_TOKEN" not in err

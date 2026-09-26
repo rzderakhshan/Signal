@@ -3,6 +3,7 @@
 venv/
 __pycache__/
 .pytest_cache/
+.state/
 state.json
 research_cache.json
 *.tmp
@@ -13,3 +14,7 @@ stock finder/
 Stock_market/
 reports/
 logs/
+
+# Local/legacy helper files not used by production
+scanner_backup.py
+find_and_test_telegram.py

@@ -1,0 +1,23 @@
+{
+  "_comment": "Optional Yahoo -> broker metadata. Discovery does not require this file. Trade Republic availability is never inferred from Yahoo alone.",
+  "BTC-EUR": {
+    "name": "Bitcoin",
+    "isin": null,
+    "trade_republic_available": null
+  },
+  "ETH-EUR": {
+    "name": "Ethereum",
+    "isin": null,
+    "trade_republic_available": null
+  },
+  "AAPL": {
+    "name": "Apple Inc.",
+    "isin": "US0378331005",
+    "trade_republic_available": null
+  },
+  "NVDA": {
+    "name": "NVIDIA Corporation",
+    "isin": "US67066G1040",
+    "trade_republic_available": null
+  }
+}
