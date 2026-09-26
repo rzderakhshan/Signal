@@ -322,6 +322,66 @@ def format_report(rows: list[MarketRow], profiles: dict[str, dict], now: datetim
     return "\n".join(lines)[:4000]
 
 
+STRUCTURED_STATE_KEYS = frozenset({"hot_watchlist", "alert_history", "last_30m_scan"})
+
+
+def prepare_runtime_state(raw_state: dict, now: datetime) -> dict:
+    """Expire old scalar stamps only; never wipe alert/dedup or hot-watch state."""
+    if not isinstance(raw_state, dict):
+        raw_state = {}
+
+    hot = raw_state.get("hot_watchlist") if isinstance(raw_state.get("hot_watchlist"), dict) else {}
+    alerts = raw_state.get("alert_history") if isinstance(raw_state.get("alert_history"), dict) else {}
+    last_30m = raw_state.get("last_30m_scan")
+
+    cleaned = {
+        key: stamp
+        for key, stamp in raw_state.items()
+        if key not in STRUCTURED_STATE_KEYS
+        and isinstance(stamp, (int, float))
+        and 0 <= now.timestamp() - stamp < 7 * 86400
+    }
+    cleaned["hot_watchlist"] = hot
+    cleaned["alert_history"] = alerts
+    if isinstance(last_30m, (int, float)):
+        cleaned["last_30m_scan"] = last_30m
+    return cleaned
+
+
+def restore_alert_history(raw: object) -> dict:
+    """Restore alert history safely; corrupt entries are skipped (no crash, no wipe-spam)."""
+    restored: dict = {}
+    if not isinstance(raw, dict):
+        return restored
+    for key, value in raw.items():
+        try:
+            if not isinstance(value, dict):
+                continue
+            ts = value["time"]
+            signals = value["signals"]
+            restored[str(key)] = {
+                "time": datetime.fromtimestamp(float(ts), timezone.utc),
+                "signals": list(signals),
+            }
+        except (KeyError, TypeError, ValueError, OSError, OverflowError):
+            continue
+    return restored
+
+
+def restore_hot_watchlist(raw: object, current_ts: float) -> dict:
+    restored: dict = {}
+    if not isinstance(raw, dict):
+        return restored
+    for key, value in raw.items():
+        try:
+            expiry = float(value)
+            if expiry > current_ts:
+                restored[str(key)] = datetime.fromtimestamp(expiry, timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+    return restored
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--watchlist", type=Path, default=Path("watchlist.json"))
@@ -369,23 +429,18 @@ def main() -> int:
         if not isinstance(state, dict):
             state = {}
     except (OSError, ValueError):
+        # Failed restore must stay safe: empty state, no crash, no forced spam path.
         state = {}
     now = datetime.now(timezone.utc)
-    
-    # State cleanup
-    state = {key: stamp for key, stamp in state.items()
-             if isinstance(stamp, (int, float)) and 0 <= now.timestamp() - stamp < 7 * 86400}
-    if "hot_watchlist" not in state or not isinstance(state["hot_watchlist"], dict): state["hot_watchlist"] = {}
-    if "alert_history" not in state or not isinstance(state["alert_history"], dict): state["alert_history"] = {}
-    
+    state = prepare_runtime_state(state, now)
+
     if args.state.parent: args.state.parent.mkdir(parents=True, exist_ok=True)
     if args.research_cache.parent: args.research_cache.parent.mkdir(parents=True, exist_ok=True)
-        
+
     monitor = activity_monitor.ActivityMonitor()
-    # Recover hot watchlist (filter expired)
     current_ts = now.timestamp()
-    monitor.hot_watchlist = {k: datetime.fromtimestamp(v, timezone.utc) for k, v in state["hot_watchlist"].items() if v > current_ts}
-    monitor.alert_history = {k: {'time': datetime.fromtimestamp(v['time'], timezone.utc), 'signals': v['signals']} for k, v in state["alert_history"].items()}
+    monitor.hot_watchlist = restore_hot_watchlist(state.get("hot_watchlist", {}), current_ts)
+    monitor.alert_history = restore_alert_history(state.get("alert_history", {}))
     
     universe = list(dict.fromkeys(symbols["stocks"] + symbols["crypto"]))
     data_5m = {}

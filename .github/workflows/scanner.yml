@@ -40,7 +40,7 @@ jobs:
           restore-keys: |
             scanner-state-
             
-      - name: Run Scanner (Dry Run Mode)
+      - name: Run Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -48,7 +48,7 @@ jobs:
           if [ "${{ github.event.inputs.test_telegram }}" == "true" ]; then
             python scanner.py --test-telegram
           else
-            python scanner.py --github-dry-run
+            python scanner.py
           fi
 
       - name: Save State (Cache)
