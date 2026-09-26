@@ -343,6 +343,40 @@ def load_local_env(path: Path) -> None:
             os.environ.setdefault(key, value.strip().strip('"').strip("'"))
 
 
+def evaluate_fundamental_context(profile: dict | None, direction: str) -> dict:
+    """Direction-relative stock fundamental confirmation. Never creates direction itself."""
+    out = {"contribution": 0, "evidence": [], "conflicts": [], "label": "N/A"}
+    if not profile or not profile.get("available"):
+        return out
+    score = float(profile.get("score") or 0)
+    catalyst = float(profile.get("catalyst_score") or 0)
+    grade = profile.get("grade", "UNKNOWN")
+    out["label"] = f"{score:.0f}/100 {grade}; catalyst {catalyst:.0f}/100"
+
+    if direction == "BUY":
+        if score >= 65:
+            out["contribution"] += 10
+            out["evidence"].append("fundamental_quality_supports_buy")
+        elif score <= 35:
+            out["contribution"] -= 10
+            out["conflicts"].append("weak_fundamentals_conflict_with_buy")
+        if catalyst >= 45:
+            out["contribution"] += 5
+            out["evidence"].append("positive_catalyst_supports_buy")
+    elif direction == "SELL":
+        if score <= 35:
+            out["contribution"] += 10
+            out["evidence"].append("weak_fundamentals_support_sell")
+        elif score >= 65:
+            out["contribution"] -= 10
+            out["conflicts"].append("strong_fundamentals_conflict_with_sell")
+        if catalyst >= 45:
+            out["conflicts"].append("positive_catalyst_conflict_with_sell")
+
+    out["contribution"] = max(-10, min(15, out["contribution"]))
+    return out
+
+
 def format_alert(a: Alert, research: dict | None = None) -> str:
     category = "کریپتو" if a.asset == "crypto" else "سهام"
     if a.asset == "crypto":
@@ -714,21 +748,17 @@ def main() -> int:
             fund_score_contrib = 0
             fund_context = "N/A"
             fund_coverage = "N/A"
+            profile = None
             if asset == "stocks":
                 profile = cache.stock(symbol, now)
                 if profile.get("available"):
-                    f_score = profile.get("score", 0)
-                    fund_context = f"Score: {f_score}/100"
+                    fund_context = (f"Score: {profile.get('score', 0)}/100 ({profile.get('grade', 'N/A')}) | "
+                                    f"Catalyst: {profile.get('catalyst_score', 0)}/100 ({profile.get('catalyst_grade', 'NONE')})")
                     fund_coverage = f"{profile.get('coverage')}%"
-                    if f_score > 60:
-                        fund_score_contrib += 10
-                    elif f_score < 40:
-                        fund_score_contrib -= 10
                 else:
                     fund_context = "Fundamentals Missing"
                     fund_coverage = "0%"
 
-            sig_score = max(0, min(100, tech_res["technical_score"] + fund_score_contrib))
             all_signals = list(set(early_res.get("signals", []) + tech_res.get("signals", [])))
 
             legacy_alerts = detect(data_5m[symbol], symbol, asset, 5, now)
@@ -761,6 +791,10 @@ def main() -> int:
             elif bullish_evidence and bearish_evidence:
                 signal_direction = "CONFLICTED"
 
+            fundamental_eval = evaluate_fundamental_context(profile, signal_direction) if asset == "stocks" else {"contribution": 0, "evidence": [], "conflicts": [], "label": "N/A"}
+            fund_score_contrib = fundamental_eval["contribution"]
+            sig_score = max(0, min(100, tech_res["technical_score"] + fund_score_contrib))
+
             conflicting_evidence = []
             if signal_direction == "CONFLICTED":
                 conflicting_evidence = bullish_evidence + bearish_evidence
@@ -768,6 +802,7 @@ def main() -> int:
                 conflicting_evidence.append("15m Trend is Bearish while signal is BUY")
             elif signal_direction == "SELL" and tech_res.get("trend_15m") == "Bullish":
                 conflicting_evidence.append("15m Trend is Bullish while signal is SELL")
+            conflicting_evidence.extend(fundamental_eval.get("conflicts", []))
 
             trend_relation = "NEUTRAL"
             if signal_direction == "BUY":
@@ -784,7 +819,7 @@ def main() -> int:
 
             confirmation_evidence = [
                 s for s in all_signals if s not in directional_evidence and not s.startswith("legacy_")
-            ]
+            ] + fundamental_eval.get("evidence", [])
             has_confirmation = len(confirmation_evidence) > 0
 
             if sig_score >= 60 and has_directional and has_confirmation:
@@ -865,6 +900,10 @@ def main() -> int:
             print(f"MARKET_STRUCTURE={tech_res.get('market_structure')}")
             print(f"FUNDAMENTAL_CONTEXT={fund_context}")
             print(f"FUNDAMENTAL_COVERAGE={fund_coverage}")
+            print(f"FUNDAMENTAL_GRADE={profile.get('grade', 'N/A') if profile else 'N/A'}")
+            print(f"CATALYST_SCORE={profile.get('catalyst_score', 'N/A') if profile else 'N/A'}")
+            print(f"CATALYST_GRADE={profile.get('catalyst_grade', 'N/A') if profile else 'N/A'}")
+            print(f"FUNDAMENTAL_CONFIRMATION={fundamental_eval.get('evidence', [])}")
             print(f"DIRECTIONAL_EVIDENCE={directional_evidence}")
             print(f"CONFIRMATION_EVIDENCE={confirmation_evidence}")
             print(f"CONFLICTING_EVIDENCE={conflicting_evidence}")
@@ -890,6 +929,8 @@ def main() -> int:
                     f"• 5m: {tech_res.get('trend_5m', 'N/A')} | 15m: {tech_res.get('trend_15m', 'N/A')} ({tech_res.get('mtf_alignment', 'N/A')})\n"
                     f"• Relation: {trend_relation}\n"
                     f"• Reasons: {', '.join(all_signals)}\n"
+                    f"• Fundamental: {fund_context} | Coverage: {fund_coverage}\n"
+                    f"• Fundamental confirmation: {', '.join(fundamental_eval.get('evidence', [])) or 'none'}\n"
                     f"• Context: {fund_context}"
                 )
                 try:
