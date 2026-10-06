@@ -1,42 +1,34 @@
-# Hyperliquid Whale Tracker → Telegram
+# Hyperliquid Whale Tracker v3
 
-این نسخه جایگزین `intraday_signal_scanner` قدیمی است. هیچ معامله‌ای انجام نمی‌دهد و فقط داده عمومی Hyperliquid را می‌خواند و به Telegram هشدار می‌فرستد.
+این نسخه به‌جای ۵ والت ثابت، یک سیستم پویا برای انتخاب و رتبه‌بندی نهنگ‌هاست.
 
-## چه چیزهایی را می‌گیرد؟
-- Fill جدید نهنگ: Open Long / Open Short / Add / Reduce / Close
-- قیمت واقعی Fill و اندازه دلاری آن
-- سفارش Limit باز جدید نهنگ و قیمت سفارش
-- حذف/پرشدن سفارش بزرگ
-- وضعیت فعلی Position: جهت، Entry، uPnL، Leverage و Liquidation
-- Consensus: وقتی حداقل 2 نهنگ روی یک Coin هم‌جهت باشند
+## منطق
+- هر ۵ دقیقه: Top 10 فعلی مانیتور می‌شوند.
+- هر ۶ ساعت: کاندیدهای جدید از لیست عمومی نهنگ‌های Hyperliquid کشف می‌شوند و با API رسمی Hyperliquid دوباره امتیاز می‌گیرند.
+- امتیاز کیفیت نهنگ 0 تا 100 بر اساس PnL ماه/هفته/کل، اندازه حساب، اندازه پوزیشن و ریسک leverage است.
+- نهنگ‌های ضعیف می‌توانند از Top 10 خارج و نهنگ‌های بهتر جایگزین شوند.
 
-## نهنگ‌های پیش‌فرض
-فایل `whales.json` پنج آدرس منتخب را دارد. هر زمان خواستی می‌توانی آدرس‌ها را عوض کنی.
+## سیگنال‌ها
+### MAIN
+وقتی چند نهنگ با کیفیت روی یک Coin و جهت هم‌راستا باشند:
+- حداقل 4 نهنگ
+- weighted consensus حداقل 68%
+- حداقل $5M پوزیشن ترکیبی
+- یک نهنگ به تنهایی بیش از 50% سمت را تشکیل ندهد
 
-## GitHub Secrets
-در Repository → Settings → Secrets and variables → Actions این دو Secret باید وجود داشته باشند:
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+A+ MAIN: حداقل 6 نهنگ و weighted consensus حداقل 78%.
 
-توکن را هرگز داخل فایل یا commit نگذار.
+### Secondary
+حرکت یک نهنگ قوی هم می‌تواند سیگنال بدهد. هر event امتیاز 0..100 می‌گیرد و بر اساس کیفیت نهنگ، حجم معامله، conviction و نوع action درجه‌بندی می‌شود.
 
-## اجرای دستی
+## GitHub Actions
+workflow قبلی همچنان هر ۵ دقیقه اجرا می‌شود. Secrets همان قبلی هستند:
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+
+## تست دستی
 ```bash
-pip install -r requirements.txt
 python whale_tracker.py --test-telegram
+python whale_tracker.py --refresh-ranking
 python whale_tracker.py
 ```
-
-## اجرای خودکار
-`.github/workflows/scanner.yml` هر 5 دقیقه اجرا می‌شود. اجرای اول فقط baseline می‌سازد تا پیام‌های قدیمی اسپم نشوند. از اجرای بعدی فقط تغییرات جدید ارسال می‌شوند.
-
-## Thresholdها
-پیش‌فرض:
-- Fill: حداقل `$100,000`
-- Limit Order: حداقل `$250,000`
-- Consensus: حداقل 2 نهنگ
-
-از GitHub workflow یا Environment Variable قابل تغییر است.
-
-## فایل‌های قدیمی
-در نسخه نهایی لازم نیست `scanner.py`, `signal_engine.py`, فایل‌های backtest، universe و گزارش PDF قبلی باقی بمانند. این پروژه فقط Whale Tracker است.

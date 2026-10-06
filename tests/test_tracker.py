@@ -1,27 +1,26 @@
-import whale_tracker as wt
+from whale_tracker import score_whale, build_consensus, Whale, signal_grade
 
 
-def test_positions_from_state():
-    data = {"assetPositions": [
-        {"position": {"coin":"BTC","szi":"2","entryPx":"80000","positionValue":"165000","unrealizedPnl":"5000","liquidationPx":"70000","leverage":{"value":10}}},
-        {"position": {"coin":"ETH","szi":"-3","entryPx":"2500","positionValue":"7800","unrealizedPnl":"-100","liquidationPx":"3100","leverage":{"value":5}}},
-    ]}
-    p = wt.positions_from_state(data)
-    assert p["BTC"]["side"] == "LONG"
-    assert p["ETH"]["side"] == "SHORT"
+def test_signal_grade():
+    assert signal_grade(90) == "A+"
+    assert signal_grade(82) == "A"
+    assert signal_grade(74) == "B"
+    assert signal_grade(60) == "C"
 
 
-def test_consensus():
-    allp = {
-        "A":{"BTC":{"side":"LONG","value":100}},
-        "B":{"BTC":{"side":"LONG","value":200}},
-        "C":{"BTC":{"side":"SHORT","value":300}},
+def test_score_profitable_above_loser():
+    ch = {"marginSummary": {"accountValue": "1000000"}, "assetPositions": [{"position": {"coin": "BTC", "szi": "10", "positionValue": "2000000", "unrealizedPnl": "0", "entryPx": "1", "leverage": {"value": 2}}}]}
+    good = [["perpWeek", {"pnlHistory": [[1, "100000"]]}], ["perpMonth", {"pnlHistory": [[1, "300000"]]}], ["perpAllTime", {"pnlHistory": [[1, "800000"]]}]]
+    bad = [["perpWeek", {"pnlHistory": [[1, "-100000"]]}], ["perpMonth", {"pnlHistory": [[1, "-300000"]]}], ["perpAllTime", {"pnlHistory": [[1, "-800000"]]}]]
+    assert score_whale(ch, good)[0] > score_whale(ch, bad)[0]
+
+
+def test_weighted_consensus():
+    whales = [Whale("w1", "0x" + "1"*40, 90, 1), Whale("w2", "0x" + "2"*40, 80, 2)]
+    pos = {
+        whales[0].address: {"ETH": {"side": "LONG", "value": 2_000_000}},
+        whales[1].address: {"ETH": {"side": "LONG", "value": 1_000_000}},
     }
-    old = wt.CONSENSUS_MIN_WHALES
-    wt.CONSENSUS_MIN_WHALES = 2
-    try:
-        c = wt.consensus_map(allp)
-        assert c["BTC:LONG"]["count"] == 2
-        assert c["BTC:LONG"]["notional"] == 300
-    finally:
-        wt.CONSENSUS_MIN_WHALES = old
+    c = build_consensus(whales, pos)["ETH:LONG"]
+    assert c["count"] == 2
+    assert c["weighted_share"] == 1.0
