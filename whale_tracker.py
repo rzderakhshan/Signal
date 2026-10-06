@@ -149,28 +149,55 @@ def positions_from_state(ch: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _action_label(fill: dict[str, Any]) -> tuple[str, str]:
+    """Return a concise action label + emoji based on Hyperliquid's fill direction."""
+    direction = str(fill.get("dir", "Fill")).strip()
+    d = direction.lower()
+    if "open long" in d:
+        return "NEW LONG", "🟢"
+    if "open short" in d:
+        return "NEW SHORT", "🔴"
+    if "close long" in d:
+        return "REDUCE/CLOSE LONG", "🟠"
+    if "close short" in d:
+        return "REDUCE/CLOSE SHORT", "🟠"
+    if str(fill.get("side")) == "B":
+        return direction.upper(), "🟢"
+    return direction.upper(), "🔴"
+
+
 def format_fill(whale: Whale, fill: dict[str, Any], pos: dict[str, Any] | None) -> str:
     coin = html.escape(str(fill.get("coin", "?")))
-    direction = html.escape(str(fill.get("dir", "Fill")))
+    action, emoji = _action_label(fill)
     px = fnum(fill.get("px"))
     sz = abs(fnum(fill.get("sz")))
     notional = px * sz
-    side = "🟢" if str(fill.get("side")) == "B" else "🔴"
     lines = [
-        f"🐋 <b>{html.escape(whale.name)}</b>  {short_addr(whale.address)}",
-        f"{side} <b>{direction}</b> — <b>{coin}</b>",
+        "🐋 <b>WHALE ALERT</b>",
+        "",
+        f"<b>{html.escape(whale.name)}</b>  <code>{short_addr(whale.address)}</code>",
+        f"{emoji} <b>{html.escape(action)}</b> — <b>{coin}</b>",
+        "",
+        f"Executed: <b>{money(notional)}</b>",
         f"Price: <b>{px:,.6g}</b>",
-        f"Fill size: <b>{sz:,.6g}</b> ≈ <b>{money(notional)}</b>",
+        f"Size: <b>{sz:,.6g}</b>",
     ]
-    if fill.get("closedPnl") not in (None, "0", "0.0"):
-        lines.append(f"Closed PnL: <b>{money(fnum(fill.get('closedPnl')))}</b>")
     if pos:
-        lines.append(
-            f"Current: <b>{pos['side']}</b> {money(pos['value'])} | Entry {pos['entry']:,.6g} | uPnL {money(pos['upnl'])}"
-        )
+        lines.extend([
+            f"Position: <b>{money(pos['value'])}</b> {pos['side']}",
+            f"Entry: <b>{pos['entry']:,.6g}</b>",
+            f"uPnL: <b>{money(pos['upnl'])}</b>",
+        ])
+        if pos.get("leverage"):
+            lines.append(f"Leverage: <b>{pos.get('leverage')}x</b>")
         if pos.get("liq"):
-            lines.append(f"Liq: {pos['liq']:,.6g} | Lev: {pos.get('leverage') or '?'}x")
-    lines.append(f"<a href=\"https://app.hyperliquid.xyz/explorer/address/{whale.address}\">Open wallet</a>")
+            lines.append(f"Liquidation: <b>{pos['liq']:,.6g}</b>")
+    if fill.get("closedPnl") not in (None, "0", "0.0"):
+        lines.append(f"Realized PnL: <b>{money(fnum(fill.get('closedPnl')))}</b>")
+    lines.extend([
+        "",
+        f"<a href=\"https://app.hyperliquid.xyz/explorer/address/{whale.address}\">View wallet on Hyperliquid ↗</a>",
+    ])
     return "\n".join(lines)
 
 
@@ -181,13 +208,20 @@ def format_order(whale: Whale, order: dict[str, Any], status: str) -> str:
     ntl = px * sz
     side = "BUY" if order.get("side") == "B" else "SELL"
     emoji = "🟦" if side == "BUY" else "🟥"
+    title = "NEW LIMIT ORDER" if status == "NEW" else "LIMIT ORDER REMOVED/FILLED"
     return "\n".join([
-        f"🐋 <b>{html.escape(whale.name)}</b>  {short_addr(whale.address)}",
-        f"{emoji} <b>{status} LIMIT {side}</b> — <b>{coin}</b>",
-        f"Limit: <b>{px:,.6g}</b>",
-        f"Size: <b>{sz:,.6g}</b> ≈ <b>{money(ntl)}</b>",
+        "📌 <b>WHALE ORDER ALERT</b>",
+        "",
+        f"<b>{html.escape(whale.name)}</b>  <code>{short_addr(whale.address)}</code>",
+        f"{emoji} <b>{title}</b> — <b>{coin}</b>",
+        "",
+        f"Side: <b>{side}</b>",
+        f"Limit price: <b>{px:,.6g}</b>",
+        f"Order value: <b>{money(ntl)}</b>",
+        f"Size: <b>{sz:,.6g}</b>",
         f"Order ID: <code>{order.get('oid')}</code>",
-        f"<a href=\"https://app.hyperliquid.xyz/explorer/address/{whale.address}\">Open wallet</a>",
+        "",
+        f"<a href=\"https://app.hyperliquid.xyz/explorer/address/{whale.address}\">View wallet on Hyperliquid ↗</a>",
     ])
 
 
@@ -287,11 +321,12 @@ def run_once(test_telegram: bool = False):
                 emoji = "🟢" if c["side"] == "LONG" else "🔴"
                 names = ", ".join(c["names"])
                 send_telegram_message(
-                    f"🔥 <b>WHALE CONSENSUS</b>\n"
+                    f"🔥 <b>WHALE CONSENSUS</b>\n\n"
                     f"{emoji} <b>{html.escape(c['coin'])} {c['side']}</b>\n"
-                    f"Whales: <b>{c['count']}/{len(whales)}</b>\n"
+                    f"Agreement: <b>{c['count']}/{len(whales)} whales</b>\n"
                     f"Combined position: <b>{money(c['notional'])}</b>\n"
-                    f"{html.escape(names)}"
+                    f"Whales: {html.escape(names)}\n\n"
+                    f"⚠️ This is whale-flow information, not an automatic trade instruction."
                 )
 
     state["consensus"] = new_consensus
