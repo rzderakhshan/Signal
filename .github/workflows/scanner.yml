@@ -1,0 +1,65 @@
+name: Hyperliquid Whale Tracker
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: 'Send one Telegram connection test'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hyperliquid-whale-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/
+          key: whale-state-${{ github.run_id }}
+          restore-keys: |
+            whale-state-
+
+      - name: Track whales
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_FILL_USD: '100000'
+          MIN_ORDER_USD: '250000'
+          CONSENSUS_MIN_WHALES: '2'
+        run: |
+          if [ "${{ github.event.inputs.test_telegram }}" = "true" ]; then
+            python whale_tracker.py --test-telegram
+          else
+            python whale_tracker.py
+          fi
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state/
+          key: whale-state-${{ github.run_id }}
