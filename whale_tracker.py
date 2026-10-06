@@ -99,7 +99,7 @@ class HyperliquidClient:
     def __init__(self, timeout: int = 20):
         self.timeout = timeout
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "HyperliquidWhaleTracker/5.0"})
+        self.session.headers.update({"User-Agent": "HyperliquidWhaleTracker/6.0"})
 
     def _post(self, payload: dict[str, Any]):
         last_error = None
@@ -176,7 +176,7 @@ def load_seed_whales() -> list[Whale]:
 
 def load_state() -> dict[str, Any]:
     blank = {
-        "version": 5, "initialized": False, "last_run_ms": 0,
+        "version": 6, "initialized": False, "last_run_ms": 0,
         "whales": {}, "consensus": {}, "ranking": {}, "ranking_updated_ms": 0,
         "signals": {"active_main": {}, "active_whale": {}, "history": [], "daily_seq": {}},
     }
@@ -329,7 +329,7 @@ def discover_addresses(seed: list[Whale]) -> list[str]:
     """Discover current directional whales from HyperScan; seeds are always fallback candidates."""
     addresses = [w.address for w in seed]
     try:
-        r = requests.get(DISCOVERY_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 WhaleTracker/5.0"})
+        r = requests.get(DISCOVERY_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 WhaleTracker/6.0"})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         found: list[str] = []
@@ -520,10 +520,24 @@ def build_consensus(whales: list[Whale], all_positions: dict[str, dict[str, dict
         avg_entry = sum(p.get("entry", 0.0) * p["value"] for _, p in rows if p.get("entry", 0.0) > 0) / max(
             sum(p["value"] for _, p in rows if p.get("entry", 0.0) > 0), 1.0
         )
+        whale_entries = []
+        for addr, p in rows:
+            whale = next((w for w in whales if w.address == addr), None)
+            whale_entries.append({
+                "address": addr,
+                "rank": whale.rank if whale else 999,
+                "quality": whale.quality if whale else qmap.get(addr, 50.0),
+                "entry": fnum(p.get("entry")),
+                "value": fnum(p.get("value")),
+                "upnl": fnum(p.get("upnl")),
+                "leverage": p.get("leverage"),
+            })
+        whale_entries.sort(key=lambda x: (x["rank"], -x["value"]))
         result[f"{coin}:{side}"] = {
             "coin": coin, "side": side, "count": len(rows), "addresses": [x[0] for x in rows],
             "notional": raw_notional, "weighted_share": share, "largest_share": largest_share,
             "quality_avg": quality_avg, "score": score, "avg_entry": avg_entry,
+            "whale_entries": whale_entries,
         }
     return result
 
@@ -543,34 +557,58 @@ def consensus_grade(c: dict[str, Any]) -> str:
 
 def format_main_open(c: dict[str, Any], whales: list[Whale], signal_id: str, open_price: float) -> str:
     wm = {w.address: w for w in whales}
-    names = ", ".join(f"#{wm[a].rank} {short_addr(a)}" for a in c["addresses"] if a in wm)
     emoji = "🟢" if c["side"] == "LONG" else "🔴"
-    return (
-        f"🚀 <b>OPEN MAIN SIGNAL — {consensus_grade(c)}</b>\n"
-        f"ID: <code>{html.escape(signal_id)}</code>\n\n"
-        f"{emoji} <b>{html.escape(c['coin'])} {c['side']}</b>\n"
-        f"Reference entry: <b>{open_price:,.6g}</b>\n"
-        f"Aligned whales: <b>{c['count']}/{len(whales)}</b>\n"
-        f"Weighted consensus: <b>{c['weighted_share']*100:.0f}%</b>\n"
-        f"Consensus score: <b>{c['score']:.0f}/100</b>\n"
-        f"Combined position: <b>{money(c['notional'])}</b>\n"
-        f"Average whale quality: <b>{c['quality_avg']:.0f}/100</b>\n"
-        f"Participants: {html.escape(names)}"
-    )
-
+    lines = [
+        f"🚀 <b>OPEN MAIN SIGNAL — {consensus_grade(c)}</b>",
+        f"ID: <code>{html.escape(signal_id)}</code>",
+        "",
+        f"{emoji} <b>{html.escape(c['coin'])} {c['side']}</b>",
+        f"Signal Entry: <b>{open_price:,.6g}</b>",
+        f"Average Whale Entry: <b>{fnum(c.get('avg_entry')):,.6g}</b>",
+        f"Aligned whales: <b>{c['count']}/{len(whales)}</b>",
+        f"Weighted consensus: <b>{c['weighted_share']*100:.0f}%</b>",
+        f"Consensus score: <b>{c['score']:.0f}/100</b>",
+        f"Combined position: <b>{money(c['notional'])}</b>",
+        f"Average whale quality: <b>{c['quality_avg']:.0f}/100</b>",
+        "",
+        "<b>Whale entries:</b>",
+    ]
+    entries = c.get("whale_entries") or []
+    for row in entries:
+        addr = row.get("address", "")
+        rank = row.get("rank", wm.get(addr).rank if addr in wm else 999)
+        entry = fnum(row.get("entry"))
+        pos_value = fnum(row.get("value"))
+        q = fnum(row.get("quality"))
+        lev = row.get("leverage")
+        lev_text = f" · {lev}x" if lev else ""
+        lines.append(
+            f"• #{rank} <code>{short_addr(addr)}</code> · Entry <b>{entry:,.6g}</b> · Position <b>{money(pos_value)}</b> · Q {q:.0f}{lev_text}"
+        )
+    return "\n".join(lines)
 
 def format_main_update(c: dict[str, Any], whales: list[Whale], sig: dict[str, Any]) -> str:
     emoji = "🟢" if c["side"] == "LONG" else "🔴"
-    return (
-        f"🟠 <b>UPDATE MAIN SIGNAL</b>\n"
-        f"ID: <code>{html.escape(sig['id'])}</code>\n\n"
-        f"{emoji} <b>{html.escape(c['coin'])} {c['side']}</b>\n"
-        f"Whales: <b>{sig.get('last_count', sig.get('open_count', 0))} → {c['count']}/{len(whales)}</b>\n"
-        f"Weighted consensus: <b>{sig.get('last_share', sig.get('open_share', 0))*100:.0f}% → {c['weighted_share']*100:.0f}%</b>\n"
-        f"Score: <b>{sig.get('last_score', sig.get('open_score', 0)):.0f} → {c['score']:.0f}/100</b>\n"
-        f"Combined position: <b>{money(c['notional'])}</b>"
-    )
-
+    lines = [
+        "🟠 <b>UPDATE MAIN SIGNAL</b>",
+        f"ID: <code>{html.escape(sig['id'])}</code>",
+        "",
+        f"{emoji} <b>{html.escape(c['coin'])} {c['side']}</b>",
+        f"Signal Entry: <b>{fnum(sig.get('open_price')):,.6g}</b>",
+        f"Current Avg Whale Entry: <b>{fnum(c.get('avg_entry')):,.6g}</b>",
+        f"Whales: <b>{sig.get('last_count', sig.get('open_count', 0))} → {c['count']}/{len(whales)}</b>",
+        f"Weighted consensus: <b>{sig.get('last_share', sig.get('open_share', 0))*100:.0f}% → {c['weighted_share']*100:.0f}%</b>",
+        f"Score: <b>{sig.get('last_score', sig.get('open_score', 0)):.0f} → {c['score']:.0f}/100</b>",
+        f"Combined position: <b>{money(c['notional'])}</b>",
+    ]
+    entries = c.get("whale_entries") or []
+    if entries:
+        lines.extend(["", "<b>Current whale entries:</b>"])
+        for row in entries:
+            lines.append(
+                f"• #{row.get('rank', 999)} <code>{short_addr(row.get('address',''))}</code> · Entry <b>{fnum(row.get('entry')):,.6g}</b> · Position <b>{money(fnum(row.get('value')))}</b>"
+            )
+    return "\n".join(lines)
 
 def format_signal_close(sig: dict[str, Any], close_price: float, closed_ms: int, reason: str, label: str = "MAIN") -> str:
     pct = close_result_pct(sig["side"], fnum(sig.get("open_price")), close_price)
@@ -579,8 +617,9 @@ def format_signal_close(sig: dict[str, Any], close_price: float, closed_ms: int,
         f"🔴 <b>CLOSE {label} SIGNAL</b>\n"
         f"ID: <code>{html.escape(sig['id'])}</code>\n\n"
         f"<b>{html.escape(sig['coin'])} {sig['side']}</b>\n"
-        f"Open: <b>{fnum(sig.get('open_price')):,.6g}</b>\n"
-        f"Close: <b>{close_price:,.6g}</b>\n"
+        f"Signal Entry: <b>{fnum(sig.get('open_price')):,.6g}</b>\n"
+        + (f"Avg Whale Entry at Open: <b>{fnum(sig.get('open_avg_whale_entry')):,.6g}</b>\n" if fnum(sig.get('open_avg_whale_entry')) > 0 else "")
+        + f"Close: <b>{close_price:,.6g}</b>\n"
         f"{emoji} Result: <b>{pct:+.2f}%</b>\n"
         f"Duration: <b>{duration_text(int(sig.get('opened_ms', closed_ms)), closed_ms)}</b>\n"
         f"Reason: <b>{html.escape(reason)}</b>"
@@ -599,7 +638,7 @@ def format_whale_lifecycle(whale: Whale, fill: dict[str, Any], pos: dict[str, An
 
 def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
     if test_telegram:
-        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v5</b>\nSignal lifecycle + Telegram delivery are working.")
+        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v6</b>\nSignal lifecycle + whale entry prices + Telegram delivery are working.")
         raise SystemExit(0 if ok else 2)
 
     state = load_state()
@@ -771,6 +810,8 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
         sig["last_share"] = c["weighted_share"]
         sig["last_score"] = c["score"]
         sig["last_notional"] = c["notional"]
+        sig["last_avg_whale_entry"] = c.get("avg_entry", 0.0)
+        sig["last_whale_entries"] = c.get("whale_entries", [])
         sig["updated_ms"] = now_ms
 
     # 2) Open newly-qualified main signals. Signal ID stays with it until close.
@@ -785,6 +826,8 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
             "open_count": c["count"], "open_share": c["weighted_share"], "open_score": c["score"],
             "last_count": c["count"], "last_share": c["weighted_share"], "last_score": c["score"],
             "last_notional": c["notional"],
+            "open_avg_whale_entry": c.get("avg_entry", 0.0),
+            "open_whale_entries": c.get("whale_entries", []),
         }
         active_main[key] = sig
         queue_alert(format_main_open(c, whales, sid, open_px), priority=100)
@@ -792,7 +835,7 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
     state["consensus"] = new_consensus
     state["last_run_ms"] = now_ms
     state["initialized"] = True
-    state["version"] = 5
+    state["version"] = 6
     save_state(state)
     flush_alerts()
     logging.info(
