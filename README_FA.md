@@ -1,34 +1,37 @@
-# Hyperliquid Whale Tracker v3
+# Hyperliquid Whale Tracker v4 → Telegram
 
-این نسخه به‌جای ۵ والت ثابت، یک سیستم پویا برای انتخاب و رتبه‌بندی نهنگ‌هاست.
-
-## منطق
-- هر ۵ دقیقه: Top 10 فعلی مانیتور می‌شوند.
-- هر ۶ ساعت: کاندیدهای جدید از لیست عمومی نهنگ‌های Hyperliquid کشف می‌شوند و با API رسمی Hyperliquid دوباره امتیاز می‌گیرند.
-- امتیاز کیفیت نهنگ 0 تا 100 بر اساس PnL ماه/هفته/کل، اندازه حساب، اندازه پوزیشن و ریسک leverage است.
-- نهنگ‌های ضعیف می‌توانند از Top 10 خارج و نهنگ‌های بهتر جایگزین شوند.
+نسخه v4 یک Top-10 پویا از نهنگ‌های Hyperliquid می‌سازد، هر 5 دقیقه آن‌ها را مانیتور می‌کند و هر 6 ساعت رتبه‌بندی را به‌روزرسانی می‌کند.
 
 ## سیگنال‌ها
-### MAIN
-وقتی چند نهنگ با کیفیت روی یک Coin و جهت هم‌راستا باشند:
-- حداقل 4 نهنگ
-- weighted consensus حداقل 68%
-- حداقل $5M پوزیشن ترکیبی
-- یک نهنگ به تنهایی بیش از 50% سمت را تشکیل ندهد
+- MAIN A/A+: هم‌جهتی چند نهنگ قوی روی یک Coin با وزن کیفیت و حجم پوزیشن.
+- Secondary A+/A/B: Fill یا Limit Order مهم یک نهنگ باکیفیت.
+- Ranking update: ورود/خروج نهنگ‌ها از Top 10.
 
-A+ MAIN: حداقل 6 نهنگ و weighted consensus حداقل 78%.
+## اصلاح v4 برای Telegram
+- پیام‌های MAIN جدا و با اولویت بالا فرستاده می‌شوند.
+- Alertهای ثانویه یک بازه در `WHALE ACTIVITY DIGEST` جمع می‌شوند تا تعداد پیام‌ها کم شود.
+- بین پیام‌ها فاصله زمانی قرار داده شده است.
+- در HTTP 429، `retry_after` تلگرام رعایت می‌شود و چند بار retry انجام می‌شود.
 
-### Secondary
-حرکت یک نهنگ قوی هم می‌تواند سیگنال بدهد. هر event امتیاز 0..100 می‌گیرد و بر اساس کیفیت نهنگ، حجم معامله، conviction و نوع action درجه‌بندی می‌شود.
+## اجرای خودکار
+GitHub Actions هر 5 دقیقه اجرا می‌شود. اجرای هر 5 دقیقه به معنی ارسال پیام هر 5 دقیقه نیست؛ فقط رویداد مهم پیام می‌فرستد.
 
-## GitHub Actions
-workflow قبلی همچنان هر ۵ دقیقه اجرا می‌شود. Secrets همان قبلی هستند:
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
+## نصب/آپدیت یک‌کلیکی در Windows
+ZIP را داخل `D:\Program` دانلود کن و `DEPLOY_AND_RUN.ps1` را اجرا کن. اسکریپت:
+1. جدیدترین `Signal_whale_tracker_v*.zip` را پیدا می‌کند.
+2. Repo را در `D:\Program\mnt\data\Signal_whale_tracker` آماده می‌کند.
+3. فایل‌های نسخه جدید را جایگزین می‌کند.
+4. Commit و Push می‌کند.
+5. Workflow را با refresh اجباری Top 10 اجرا می‌کند.
+6. تا پایان Run صبر می‌کند و خط‌های مهم Log را نشان می‌دهد.
 
-## تست دستی
-```bash
-python whale_tracker.py --test-telegram
-python whale_tracker.py --refresh-ranking
-python whale_tracker.py
+اگر اجرای PowerShell script محدود بود، از PowerShell این را اجرا کن:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+& "D:\Program\mnt\data\Signal_whale_tracker\DEPLOY_AND_RUN.ps1"
 ```
+
+GitHub Secrets لازم:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`

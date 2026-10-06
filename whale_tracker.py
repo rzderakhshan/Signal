@@ -45,6 +45,47 @@ STRONG_MIN_WHALES = int(os.getenv("STRONG_MIN_WHALES", "6"))
 STRONG_MIN_WEIGHTED_SHARE = float(os.getenv("STRONG_MIN_WEIGHTED_SHARE", "0.78"))
 MAX_SINGLE_WHALE_SHARE = float(os.getenv("MAX_SINGLE_WHALE_SHARE", "0.50"))
 
+# Telegram delivery queue: main signals first, secondary alerts bundled to avoid 429 bursts.
+TELEGRAM_BUNDLE_MAX_CHARS = int(os.getenv("TELEGRAM_BUNDLE_MAX_CHARS", "3600"))
+_PENDING_ALERTS: list[tuple[int, str]] = []
+
+
+def queue_alert(text: str, priority: int = 50):
+    if text:
+        _PENDING_ALERTS.append((priority, text))
+
+
+def flush_alerts():
+    if not _PENDING_ALERTS:
+        return
+    pending = sorted(_PENDING_ALERTS, key=lambda x: x[0], reverse=True)
+    _PENDING_ALERTS.clear()
+
+    # Keep main signals visually separate. Bundle lower-priority events so a busy
+    # five-minute window produces only a small number of Telegram messages.
+    secondary: list[str] = []
+    for priority, text in pending:
+        if priority >= 90:
+            send_telegram_message(text)
+        else:
+            secondary.append(text)
+
+    if secondary:
+        header = "📡 <b>WHALE ACTIVITY DIGEST</b>\n\n"
+        chunks: list[str] = []
+        current = header
+        for msg in secondary:
+            piece = msg + "\n\n────────────\n\n"
+            if len(current) + len(piece) > TELEGRAM_BUNDLE_MAX_CHARS and current != header:
+                chunks.append(current.rstrip("\n─"))
+                current = header + piece
+            else:
+                current += piece
+        if current != header:
+            chunks.append(current.rstrip("\n─"))
+        for chunk in chunks:
+            send_telegram_message(chunk)
+
 
 @dataclass(frozen=True)
 class Whale:
@@ -58,7 +99,7 @@ class HyperliquidClient:
     def __init__(self, timeout: int = 20):
         self.timeout = timeout
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "HyperliquidWhaleTracker/3.0"})
+        self.session.headers.update({"User-Agent": "HyperliquidWhaleTracker/4.0"})
 
     def _post(self, payload: dict[str, Any]):
         last_error = None
@@ -132,7 +173,7 @@ def load_seed_whales() -> list[Whale]:
 
 def load_state() -> dict[str, Any]:
     blank = {
-        "version": 3, "initialized": False, "last_run_ms": 0,
+        "version": 4, "initialized": False, "last_run_ms": 0,
         "whales": {}, "consensus": {}, "ranking": {}, "ranking_updated_ms": 0,
     }
     if not STATE_PATH.exists():
@@ -241,7 +282,7 @@ def discover_addresses(seed: list[Whale]) -> list[str]:
     """Discover current directional whales from HyperScan; seeds are always fallback candidates."""
     addresses = [w.address for w in seed]
     try:
-        r = requests.get(DISCOVERY_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 WhaleTracker/3.0"})
+        r = requests.get(DISCOVERY_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 WhaleTracker/4.0"})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         found: list[str] = []
@@ -317,7 +358,7 @@ def refresh_ranking(client: HyperliquidClient, state: dict[str, Any], force: boo
             parts.append("\nRemoved:")
             for a in exits[:5]:
                 parts.append(f"• <code>{short_addr(a)}</code>")
-        send_telegram_message("\n".join(parts))
+        queue_alert("\n".join(parts), priority=80)
 
     return [Whale(x["name"], x["address"], fnum(x.get("quality")), int(x.get("rank", 999))) for x in selected]
 
@@ -469,7 +510,7 @@ def format_consensus(c: dict[str, Any], whales: list[Whale]) -> str:
 
 def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
     if test_telegram:
-        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v3</b>\nTelegram connection is working.")
+        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v4</b>\nTelegram connection is working.")
         raise SystemExit(0 if ok else 2)
 
     state = load_state()
@@ -513,7 +554,7 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
                     score = event_score(whale, notional, positions.get(str(fill.get("coin"))), action)
                     event_coins.add(str(fill.get("coin")))
                     if score >= SECONDARY_MIN_SCORE:
-                        send_telegram_message(format_fill(whale, fill, positions.get(str(fill.get("coin"))), score))
+                        queue_alert(format_fill(whale, fill, positions.get(str(fill.get("coin"))), score), priority=70 if score < 88 else 85)
 
                 for oid, order in current_orders.items():
                     if oid not in previous_orders:
@@ -522,7 +563,7 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
                             score = event_score(whale, notional, positions.get(str(order.get("coin"))), "NEW ORDER")
                             event_coins.add(str(order.get("coin")))
                             if score >= SECONDARY_MIN_SCORE:
-                                send_telegram_message(format_order(whale, order, "NEW", score))
+                                queue_alert(format_order(whale, order, "NEW", score), priority=65 if score < 88 else 82)
 
                 for oid, old_order in previous_orders.items():
                     if oid not in current_orders:
@@ -530,7 +571,7 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
                         if notional >= MIN_ORDER_USD:
                             score = event_score(whale, notional, positions.get(str(old_order.get("coin"))), "REMOVED ORDER")
                             if score >= SECONDARY_MIN_SCORE + 5:
-                                send_telegram_message(format_order(whale, old_order, "REMOVED/FILLED", score))
+                                queue_alert(format_order(whale, old_order, "REMOVED/FILLED", score), priority=60)
 
             ws["fills"] = list(dict.fromkeys((ws.get("fills", []) + current_fill_keys)))[-5000:]
             ws["orders"] = current_orders; ws["positions"] = positions; ws["updated_ms"] = now_ms
@@ -549,14 +590,15 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
             stronger = not old or c["count"] > old_count or c["score"] >= old_score + 4
             # Main signal is event-driven; a new/stronger consensus after activity on that coin.
             if stronger and (not event_coins or c["coin"] in event_coins):
-                send_telegram_message(format_consensus(c, whales))
+                queue_alert(format_consensus(c, whales), priority=100)
 
     state["consensus"] = new_consensus
     state["last_run_ms"] = now_ms
     state["initialized"] = True
-    state["version"] = 3
+    state["version"] = 4
     save_state(state)
-    logging.info("Done. whales=%d first_run=%s top=%s", len(whales), first_run, ",".join(short_addr(w.address) for w in whales))
+    flush_alerts()
+    logging.info("Done. whales=%d first_run=%s alerts_flushed=true top=%s", len(whales), first_run, ",".join(short_addr(w.address) for w in whales))
 
 
 def main():

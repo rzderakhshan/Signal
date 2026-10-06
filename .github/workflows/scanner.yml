@@ -10,6 +10,11 @@ on:
         type: boolean
         required: false
         default: false
+      refresh_ranking:
+        description: 'Force Top-10 whale ranking refresh now'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -21,7 +26,7 @@ concurrency:
 jobs:
   track:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,12 +52,24 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MIN_FILL_USD: '100000'
-          MIN_ORDER_USD: '250000'
-          CONSENSUS_MIN_WHALES: '2'
+          TELEGRAM_MIN_INTERVAL_SEC: '1.5'
+          TELEGRAM_MAX_RETRIES: '5'
+          TELEGRAM_BUNDLE_MAX_CHARS: '3600'
+          TOP_WHALES: '10'
+          RANK_REFRESH_HOURS: '6'
+          DISCOVERY_CANDIDATES: '30'
+          MIN_FILL_USD: '75000'
+          MIN_ORDER_USD: '200000'
+          SECONDARY_MIN_SCORE: '68'
+          MAIN_MIN_WHALES: '4'
+          MAIN_MIN_WEIGHTED_SHARE: '0.68'
+          STRONG_MIN_WHALES: '6'
+          STRONG_MIN_WEIGHTED_SHARE: '0.78'
         run: |
           if [ "${{ github.event.inputs.test_telegram }}" = "true" ]; then
             python whale_tracker.py --test-telegram
+          elif [ "${{ github.event.inputs.refresh_ranking }}" = "true" ]; then
+            python whale_tracker.py --refresh-ranking
           else
             python whale_tracker.py
           fi
