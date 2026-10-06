@@ -53,6 +53,13 @@ STRONG_MIN_WHALES = int(os.getenv("STRONG_MIN_WHALES", "6"))
 STRONG_MIN_WEIGHTED_SHARE = float(os.getenv("STRONG_MIN_WEIGHTED_SHARE", "0.78"))
 MAX_SINGLE_WHALE_SHARE = float(os.getenv("MAX_SINGLE_WHALE_SHARE", "0.50"))
 
+# Fresh-entry engine: MAIN signals are opened only from RECENT executed entries,
+# never merely because a whale has an old profitable position.
+FRESH_ENTRY_WINDOW_MIN = int(os.getenv("FRESH_ENTRY_WINDOW_MIN", "60"))
+FRESH_ENTRY_WINDOW_MS = FRESH_ENTRY_WINDOW_MIN * 60 * 1000
+FRESH_ENTRY_MIN_USD = float(os.getenv("FRESH_ENTRY_MIN_USD", str(MIN_FILL_USD)))
+MAIN_EXIT_MIN_WHALES = int(os.getenv("MAIN_EXIT_MIN_WHALES", "2"))
+
 # Telegram delivery queue: main signals first, secondary alerts bundled to avoid 429 bursts.
 TELEGRAM_BUNDLE_MAX_CHARS = int(os.getenv("TELEGRAM_BUNDLE_MAX_CHARS", "3600"))
 _PENDING_ALERTS: list[tuple[int, str]] = []
@@ -480,7 +487,7 @@ def format_fill(whale: Whale, fill: dict[str, Any], pos: dict[str, Any] | None, 
     ]
     if pos:
         lines.extend([
-            f"Position: <b>{money(pos['value'])}</b> {pos['side']}", f"Entry: <b>{pos['entry']:,.6g}</b>",
+            f"Position: <b>{money(pos['value'])}</b> {pos['side']}",
             f"uPnL: <b>{money(pos['upnl'])}</b>",
         ])
         if pos.get("leverage"):
@@ -693,6 +700,134 @@ def build_consensus(whales: list[Whale], all_positions: dict[str, dict[str, dict
     return result
 
 
+
+def build_fresh_consensus(
+    whales: list[Whale],
+    state: dict[str, Any],
+    all_positions: dict[str, dict[str, dict[str, Any]]],
+    now_ms: int,
+) -> dict[str, dict[str, Any]]:
+    """Consensus built ONLY from recent executed OPEN/ADD fills.
+
+    Old position entry prices do not qualify a whale for a new MAIN signal.
+    A whale contributes only if it executed a fresh entry within
+    FRESH_ENTRY_WINDOW_MIN and still holds that side now.
+    """
+    qmap = {w.address: max(1.0, w.quality) for w in whales}
+    wmap = {w.address: w for w in whales}
+    cutoff = now_ms - FRESH_ENTRY_WINDOW_MS
+
+    # Aggregate multiple fresh fills from the same whale/coin/side.
+    agg: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for whale in whales:
+        ws = state.get("whales", {}).get(whale.address, {}) or {}
+        entries = ws.get("fresh_entries", []) or []
+        kept = []
+        for e in entries:
+            t = int(e.get("time", 0))
+            if t < cutoff:
+                continue
+            kept.append(e)
+            coin = str(e.get("coin", ""))
+            side = str(e.get("side", ""))
+            if not coin or side not in ("LONG", "SHORT"):
+                continue
+            # Must still hold the same direction now.
+            pos = all_positions.get(whale.address, {}).get(coin)
+            if not pos or pos.get("side") != side:
+                continue
+            key = (whale.address, coin, side)
+            row = agg.setdefault(key, {
+                "address": whale.address, "coin": coin, "side": side,
+                "notional": 0.0, "px_notional": 0.0, "latest_ms": 0,
+                "market_like": False,
+            })
+            n = abs(fnum(e.get("notional")))
+            px = fnum(e.get("px"))
+            row["notional"] += n
+            row["px_notional"] += px * n
+            row["latest_ms"] = max(row["latest_ms"], t)
+            row["market_like"] = row["market_like"] or bool(e.get("crossed"))
+        ws["fresh_entries"] = kept
+
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    totals_by_coin: dict[str, float] = {}
+    for row in agg.values():
+        if row["notional"] < FRESH_ENTRY_MIN_USD:
+            continue
+        row["fresh_entry"] = row["px_notional"] / max(row["notional"], 1.0)
+        q = qmap.get(row["address"], 50.0)
+        weighted = row["notional"] * q / 100.0
+        totals_by_coin[row["coin"]] = totals_by_coin.get(row["coin"], 0.0) + weighted
+        buckets.setdefault((row["coin"], row["side"]), []).append(row)
+
+    result: dict[str, dict[str, Any]] = {}
+    for (coin, side), rows in buckets.items():
+        weighted_side = sum(r["notional"] * qmap.get(r["address"], 50.0) / 100.0 for r in rows)
+        total = max(totals_by_coin.get(coin, 0.0), 1.0)
+        share = weighted_side / total
+        raw_notional = sum(r["notional"] for r in rows)
+        largest = max((r["notional"] for r in rows), default=0.0)
+        largest_share = largest / max(raw_notional, 1.0)
+        quality_avg = sum(qmap.get(r["address"], 50.0) for r in rows) / max(len(rows), 1)
+        score = clamp(
+            45 * share
+            + 30 * (len(rows) / max(len(whales), 1))
+            + 25 * (quality_avg / 100.0),
+            0, 100,
+        )
+        avg_fresh_entry = sum(r["fresh_entry"] * r["notional"] for r in rows) / max(raw_notional, 1.0)
+        fresh_entries = []
+        for r in rows:
+            whale = wmap.get(r["address"])
+            pos = all_positions.get(r["address"], {}).get(coin, {})
+            fresh_entries.append({
+                "address": r["address"],
+                "rank": whale.rank if whale else 999,
+                "quality": whale.quality if whale else qmap.get(r["address"], 50.0),
+                "fresh_entry": r["fresh_entry"],
+                "fresh_notional": r["notional"],
+                "latest_ms": r["latest_ms"],
+                "market_like": r["market_like"],
+                "position_value": fnum(pos.get("value")),
+            })
+        fresh_entries.sort(key=lambda x: (x["rank"], -x["fresh_notional"]))
+        result[f"{coin}:{side}"] = {
+            "coin": coin, "side": side, "count": len(rows),
+            "addresses": [r["address"] for r in rows],
+            "notional": raw_notional, "weighted_share": share,
+            "largest_share": largest_share, "quality_avg": quality_avg,
+            "score": score, "avg_entry": avg_fresh_entry,
+            "whale_entries": fresh_entries,
+            "fresh": True,
+        }
+    return result
+
+
+def tracked_main_context(
+    sig: dict[str, Any],
+    whales: list[Whale],
+    all_positions: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Current status of whales that actually created this signal."""
+    participants = sig.get("participants", []) or []
+    current = []
+    for row in participants:
+        addr = row.get("address")
+        pos = all_positions.get(addr, {}).get(sig.get("coin"))
+        if pos and pos.get("side") == sig.get("side"):
+            current.append({
+                **row,
+                "position_value": fnum(pos.get("value")),
+                "upnl": fnum(pos.get("upnl")),
+            })
+    return {
+        "count": len(current),
+        "participants": current,
+        "notional": sum(x.get("position_value", 0.0) for x in current),
+    }
+
+
 def qualifies_main(c: dict[str, Any]) -> bool:
     return (
         c["count"] >= MAIN_MIN_WHALES and c["weighted_share"] >= MAIN_MIN_WEIGHTED_SHARE
@@ -715,50 +850,54 @@ def format_main_open(c: dict[str, Any], whales: list[Whale], signal_id: str, ope
         "",
         f"{emoji} <b>{html.escape(c['coin'])} {c['side']}</b>",
         f"Signal Entry: <b>{open_price:,.6g}</b>",
-        f"Average Whale Entry: <b>{fnum(c.get('avg_entry')):,.6g}</b>",
+        f"Average Fresh Whale Entry: <b>{fnum(c.get('avg_entry')):,.6g}</b>",
         f"Aligned whales: <b>{c['count']}/{len(whales)}</b>",
         f"Weighted consensus: <b>{c['weighted_share']*100:.0f}%</b>",
         f"Consensus score: <b>{c['score']:.0f}/100</b>",
         f"Combined position: <b>{money(c['notional'])}</b>",
         f"Average whale quality: <b>{c['quality_avg']:.0f}/100</b>",
         "",
-        "<b>Whale entries:</b>",
+        "<b>Fresh whale executions:</b>",
     ]
     entries = c.get("whale_entries") or []
     for row in entries:
         addr = row.get("address", "")
         rank = row.get("rank", wm.get(addr).rank if addr in wm else 999)
-        entry = fnum(row.get("entry"))
-        pos_value = fnum(row.get("value"))
+        entry = fnum(row.get("fresh_entry", row.get("entry")))
+        pos_value = fnum(row.get("position_value", row.get("value")))
         q = fnum(row.get("quality"))
         lev = row.get("leverage")
         lev_text = f" · {lev}x" if lev else ""
         lines.append(
-            f"• #{rank} <code>{short_addr(addr)}</code> · Entry <b>{entry:,.6g}</b> · Position <b>{money(pos_value)}</b> · Q {q:.0f}{lev_text}"
+            f"• #{rank} <code>{short_addr(addr)}</code> · Fresh Entry <b>{entry:,.6g}</b> · Fresh Buy <b>{money(fnum(row.get('fresh_notional')))}</b> · Position <b>{money(pos_value)}</b> · Q {q:.0f}{lev_text}"
         )
     return "\n".join(lines)
 
 def format_main_update(c: dict[str, Any], whales: list[Whale], sig: dict[str, Any]) -> str:
-    emoji = "🟢" if c["side"] == "LONG" else "🔴"
+    emoji = "🟢" if sig["side"] == "LONG" else "🔴"
+    current_count = int(c.get("count", 0))
     lines = [
         "🟠 <b>UPDATE MAIN SIGNAL</b>",
         f"ID: <code>{html.escape(sig['id'])}</code>",
         "",
-        f"{emoji} <b>{html.escape(c['coin'])} {c['side']}</b>",
+        f"{emoji} <b>{html.escape(sig['coin'])} {sig['side']}</b>",
         f"Signal Entry: <b>{fnum(sig.get('open_price')):,.6g}</b>",
-        f"Current Avg Whale Entry: <b>{fnum(c.get('avg_entry')):,.6g}</b>",
-        f"Whales: <b>{sig.get('last_count', sig.get('open_count', 0))} → {c['count']}/{len(whales)}</b>",
-        f"Weighted consensus: <b>{sig.get('last_share', sig.get('open_share', 0))*100:.0f}% → {c['weighted_share']*100:.0f}%</b>",
-        f"Score: <b>{sig.get('last_score', sig.get('open_score', 0)):.0f} → {c['score']:.0f}/100</b>",
-        f"Combined position: <b>{money(c['notional'])}</b>",
+        f"Fresh whales still holding: <b>{current_count}/{sig.get('open_count', current_count)}</b>",
+        f"Current tracked position: <b>{money(fnum(c.get('notional')))}</b>",
     ]
-    entries = c.get("whale_entries") or []
+    entries = c.get("participants") or []
     if entries:
-        lines.extend(["", "<b>Current whale entries:</b>"])
+        lines.extend(["", "<b>Signal participants:</b>"])
         for row in entries:
             lines.append(
-                f"• #{row.get('rank', 999)} <code>{short_addr(row.get('address',''))}</code> · Entry <b>{fnum(row.get('entry')):,.6g}</b> · Position <b>{money(fnum(row.get('value')))}</b>"
+                f"• #{row.get('rank', 999)} <code>{short_addr(row.get('address',''))}</code> · "
+                f"Fresh Entry <b>{fnum(row.get('fresh_entry')):,.6g}</b> · "
+                f"Position <b>{money(fnum(row.get('position_value')))}</b>"
             )
+    lines.extend([
+        "",
+        "توضیح: فقط نهنگ‌هایی نمایش داده می‌شوند که هنگام ایجاد این سیگنال واقعاً ورود تازه داشتند؛ ورودهای قدیمی مبنای سیگنال جدید نیستند."
+    ])
     return "\n".join(lines)
 
 def format_signal_close(sig: dict[str, Any], close_price: float, closed_ms: int, reason: str, label: str = "MAIN") -> str:
@@ -789,11 +928,24 @@ def format_whale_lifecycle(whale: Whale, fill: dict[str, Any], pos: dict[str, An
 
 def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
     if test_telegram:
-        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v7</b>\nSignal lifecycle + whale entry prices + Telegram delivery are working.")
+        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v8</b>\nSignal lifecycle + whale entry prices + Telegram delivery are working.")
         raise SystemExit(0 if ok else 2)
 
     state = load_state()
     signals = ensure_signal_state(state)
+
+    # v8 migration: legacy MAIN signals were based on all open positions and could
+    # be dominated by old entries. Start the fresh-entry MAIN engine cleanly.
+    if int(state.get("version", 0)) < 8:
+        for old_sig in list(signals.get("active_main", {}).values()):
+            archived = dict(old_sig)
+            archived.update({"status": "MIGRATED_OUT", "close_reason": "v8 fresh-entry engine migration"})
+            archive_signal(signals, archived)
+        signals["active_main"] = {}
+        for ws in state.get("whales", {}).values():
+            ws["fresh_entries"] = []
+        state["fresh_engine_started_ms"] = int(time.time() * 1000)
+
     client = HyperliquidClient()
     whales = refresh_ranking(client, state, force=refresh_ranking_now)
     now_ms = int(time.time() * 1000)
@@ -890,6 +1042,20 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
                     action, _, fill_side = action_label(fill)
                     pos = positions.get(coin)
                     score = event_score(whale, notional, pos, action)
+
+                    # Record only REAL fresh opening/add executions for the fresh-main engine.
+                    # Old position average entries never create a new MAIN signal.
+                    if action.startswith("NEW ") and notional >= FRESH_ENTRY_MIN_USD:
+                        ws.setdefault("fresh_entries", []).append({
+                            "time": int(fill.get("time", now_ms)),
+                            "coin": coin,
+                            "side": fill_side,
+                            "px": px,
+                            "notional": notional,
+                            "crossed": bool(fill.get("crossed")),
+                            "tid": str(fill.get("tid") or ""),
+                        })
+
                     event_coins.add(coin)
                     whale_key = f"{whale.address}:{coin}"
                     active = signals["active_whale"].get(whale_key)
@@ -1031,60 +1197,81 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
             queue_alert(format_limit_cluster(cluster), priority=91)
     signals["limit_clusters"] = current_clusters
 
-    new_consensus = build_consensus(whales, all_positions)
+    # MAIN signals: OPEN only from fresh executed entries.
+    fresh_consensus = build_fresh_consensus(whales, state, all_positions, now_ms)
+    position_consensus = build_consensus(whales, all_positions)
     active_main = signals["active_main"]
 
-    # 1) Close or update already-open main signals.
+    # 1) Maintain/close active MAIN signals using only the whales that CREATED them.
     for key, sig in list(active_main.items()):
-        c = new_consensus.get(key)
-        still_valid = bool(c and qualifies_main(c))
-        if not still_valid:
-            opposite = "SHORT" if sig["side"] == "LONG" else "LONG"
-            flipped = new_consensus.get(f"{sig['coin']}:{opposite}")
-            reason = f"Consensus flipped to {opposite}" if flipped and qualifies_main(flipped) else "Consensus dropped below main threshold"
+        ctx = tracked_main_context(sig, whales, all_positions)
+
+        # A fresh opposite consensus is a high-confidence exit reason.
+        opposite = "SHORT" if sig["side"] == "LONG" else "LONG"
+        flipped = fresh_consensus.get(f"{sig['coin']}:{opposite}")
+        flipped_now = bool(flipped and qualifies_main(flipped))
+
+        still_valid = ctx["count"] >= min(
+            MAIN_EXIT_MIN_WHALES,
+            max(1, int(sig.get("open_count", MAIN_EXIT_MIN_WHALES)))
+        )
+
+        if flipped_now or not still_valid:
+            reason = (
+                f"Fresh whale flow flipped to {opposite}"
+                if flipped_now
+                else "Fresh-entry participants dropped below hold threshold"
+            )
             close_px = mids.get(sig["coin"], fnum(sig.get("open_price")))
             closed = dict(sig)
-            closed.update({"closed_ms": now_ms, "close_price": close_px, "close_reason": reason, "status": "CLOSED"})
+            closed.update({
+                "closed_ms": now_ms, "close_price": close_px,
+                "close_reason": reason, "status": "CLOSED"
+            })
             queue_alert(format_signal_close(closed, close_px, now_ms, reason, "MAIN"), priority=100)
             archive_signal(signals, closed)
             active_main.pop(key, None)
             continue
 
-        count_changed = int(c["count"]) != int(sig.get("last_count", sig.get("open_count", 0)))
-        share_changed = abs(c["weighted_share"] - fnum(sig.get("last_share", sig.get("open_share", 0)))) >= 0.08
-        score_changed = abs(c["score"] - fnum(sig.get("last_score", sig.get("open_score", 0)))) >= 8
-        if count_changed or share_changed or score_changed:
-            queue_alert(format_main_update(c, whales, sig), priority=92)
-        sig["last_count"] = c["count"]
-        sig["last_share"] = c["weighted_share"]
-        sig["last_score"] = c["score"]
-        sig["last_notional"] = c["notional"]
-        sig["last_avg_whale_entry"] = c.get("avg_entry", 0.0)
-        sig["last_whale_entries"] = c.get("whale_entries", [])
+        count_changed = int(ctx["count"]) != int(sig.get("last_count", sig.get("open_count", 0)))
+        notional_changed = abs(ctx["notional"] - fnum(sig.get("last_notional"))) / max(ctx["notional"], 1.0) >= 0.20
+        if count_changed or notional_changed:
+            queue_alert(format_main_update(ctx, whales, sig), priority=92)
+
+        sig["last_count"] = ctx["count"]
+        sig["last_notional"] = ctx["notional"]
         sig["updated_ms"] = now_ms
 
-    # 2) Open newly-qualified main signals. Signal ID stays with it until close.
-    for key, c in new_consensus.items():
+    # 2) Open MAIN signals ONLY when multiple Top-10 whales executed fresh entries
+    # within the configured fresh window. Old 67k/70k position entries cannot trigger.
+    for key, c in fresh_consensus.items():
         if not qualifies_main(c) or key in active_main:
             continue
+
         open_px = mids.get(c["coin"], fnum(c.get("avg_entry")))
         sid = next_signal_id(state, "MAIN", c["coin"], c["side"], now_ms)
+        participants = c.get("whale_entries", [])
         sig = {
             "id": sid, "type": "MAIN", "coin": c["coin"], "side": c["side"],
             "open_price": open_px, "opened_ms": now_ms, "status": "OPEN",
-            "open_count": c["count"], "open_share": c["weighted_share"], "open_score": c["score"],
-            "last_count": c["count"], "last_share": c["weighted_share"], "last_score": c["score"],
+            "open_count": c["count"], "open_share": c["weighted_share"],
+            "open_score": c["score"], "last_count": c["count"],
             "last_notional": c["notional"],
             "open_avg_whale_entry": c.get("avg_entry", 0.0),
-            "open_whale_entries": c.get("whale_entries", []),
+            "participants": participants,
+            "fresh_window_min": FRESH_ENTRY_WINDOW_MIN,
         }
         active_main[key] = sig
-        queue_alert(format_main_open(c, whales, sid, open_px), priority=100)
+        queue_alert(
+            format_main_open(c, whales, sid, open_px)
+            + f"\n\nتوضیح: این سیگنال فقط از ورودهای اجراشده در {FRESH_ENTRY_WINDOW_MIN} دقیقه اخیر ساخته شده؛ پوزیشن‌های قدیمی در ایجاد آن حساب نمی‌شوند.",
+            priority=100,
+        )
 
-    state["consensus"] = new_consensus
+    state["consensus"] = fresh_consensus
     state["last_run_ms"] = now_ms
     state["initialized"] = True
-    state["version"] = 7
+    state["version"] = 8
     save_state(state)
     flush_alerts()
     logging.info(
@@ -1095,7 +1282,7 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dynamic Hyperliquid whale ranking + signal lifecycle tracker")
+    parser = argparse.ArgumentParser(description="Dynamic Hyperliquid whale ranking + fresh-entry signal lifecycle tracker")
     parser.add_argument("--test-telegram", action="store_true")
     parser.add_argument("--refresh-ranking", action="store_true")
     args = parser.parse_args()
