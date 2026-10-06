@@ -24,3 +24,16 @@ def test_weighted_consensus():
     c = build_consensus(whales, pos)["ETH:LONG"]
     assert c["count"] == 2
     assert c["weighted_share"] == 1.0
+
+from whale_tracker import next_signal_id, close_result_pct, duration_text
+
+
+def test_signal_id_sequence_and_result():
+    state = {}
+    a = next_signal_id(state, "MAIN", "ETH", "LONG", 1791331200000)
+    b = next_signal_id(state, "MAIN", "ETH", "LONG", 1791331200000)
+    assert a != b
+    assert a.startswith("MAIN-ETH-LONG-")
+    assert close_result_pct("LONG", 100, 110) == 10
+    assert close_result_pct("SHORT", 100, 90) == 10
+    assert duration_text(0, 3_660_000) == "1h 1m"

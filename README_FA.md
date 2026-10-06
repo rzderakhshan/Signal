@@ -1,37 +1,57 @@
-# Hyperliquid Whale Tracker v4 → Telegram
+# Hyperliquid Whale Tracker v5
 
-نسخه v4 یک Top-10 پویا از نهنگ‌های Hyperliquid می‌سازد، هر 5 دقیقه آن‌ها را مانیتور می‌کند و هر 6 ساعت رتبه‌بندی را به‌روزرسانی می‌کند.
+نسخه v5 علاوه بر Top-10 پویا و سیگنال اجماع، چرخه کامل هر سیگنال را نگه می‌دارد تا باز و بسته شدن آن با یک ID ثابت قابل پیگیری باشد.
 
-## سیگنال‌ها
-- MAIN A/A+: هم‌جهتی چند نهنگ قوی روی یک Coin با وزن کیفیت و حجم پوزیشن.
-- Secondary A+/A/B: Fill یا Limit Order مهم یک نهنگ باکیفیت.
-- Ranking update: ورود/خروج نهنگ‌ها از Top 10.
+## Signal ID و چرخه معامله
+سیگنال اصلی نمونه:
 
-## اصلاح v4 برای Telegram
-- پیام‌های MAIN جدا و با اولویت بالا فرستاده می‌شوند.
-- Alertهای ثانویه یک بازه در `WHALE ACTIVITY DIGEST` جمع می‌شوند تا تعداد پیام‌ها کم شود.
-- بین پیام‌ها فاصله زمانی قرار داده شده است.
-- در HTTP 429، `retry_after` تلگرام رعایت می‌شود و چند بار retry انجام می‌شود.
+`MAIN-ETH-LONG-20261006-001`
 
-## اجرای خودکار
-GitHub Actions هر 5 دقیقه اجرا می‌شود. اجرای هر 5 دقیقه به معنی ارسال پیام هر 5 دقیقه نیست؛ فقط رویداد مهم پیام می‌فرستد.
+سیگنال نهنگ منفرد نمونه:
 
-## نصب/آپدیت یک‌کلیکی در Windows
-ZIP را داخل `D:\Program` دانلود کن و `DEPLOY_AND_RUN.ps1` را اجرا کن. اسکریپت:
-1. جدیدترین `Signal_whale_tracker_v*.zip` را پیدا می‌کند.
-2. Repo را در `D:\Program\mnt\data\Signal_whale_tracker` آماده می‌کند.
-3. فایل‌های نسخه جدید را جایگزین می‌کند.
-4. Commit و Push می‌کند.
-5. Workflow را با refresh اجباری Top 10 اجرا می‌کند.
-6. تا پایان Run صبر می‌کند و خط‌های مهم Log را نشان می‌دهد.
+`WHL-SOL-SHORT-20261006-002`
 
-اگر اجرای PowerShell script محدود بود، از PowerShell این را اجرا کن:
+همان ID تا پایان سیگنال ثابت می‌ماند.
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass -Force
-& "D:\Program\mnt\data\Signal_whale_tracker\DEPLOY_AND_RUN.ps1"
-```
+Telegram می‌تواند سه نوع پیام بدهد:
+- `OPEN MAIN SIGNAL` / `OPEN WHALE SIGNAL`
+- `UPDATE MAIN SIGNAL` / `UPDATE WHALE SIGNAL`
+- `CLOSE MAIN SIGNAL` / `CLOSE WHALE SIGNAL`
 
-GitHub Secrets لازم:
+در پیام CLOSE موارد زیر می‌آید:
+- Signal ID
+- Coin و جهت LONG/SHORT
+- قیمت مرجع باز شدن
+- قیمت بسته شدن
+- نتیجه درصدی از زمان صدور سیگنال
+- مدت باز بودن
+- دلیل بسته شدن
+
+برای MAIN SIGNAL بسته شدن زمانی رخ می‌دهد که Consensus دیگر شروط اصلی را نداشته باشد یا جهت اجماع برگردد.
+برای WHALE SIGNAL بسته شدن زمانی ثبت می‌شود که همان نهنگ پوزیشن مربوطه را ببندد/برگرداند یا از Top-10 خارج شود.
+
+## Top-10 پویا
+- هر 5 دقیقه مانیتور می‌شود.
+- هر 6 ساعت Ranking دوباره ارزیابی می‌شود.
+- نهنگ بهتر می‌تواند جای نهنگ ضعیف‌تر را بگیرد.
+- امتیاز نهنگ از PnL اخیر، PnL ماهانه/کل، اندازه حساب، اندازه پوزیشن و ریسک ساخته می‌شود.
+
+## Main Signal
+MAIN فقط وقتی باز می‌شود که چند نهنگ قوی هم‌جهت باشند و شروط `MAIN_MIN_WHALES`, `MAIN_MIN_WEIGHTED_SHARE` و حداقل Notional برقرار باشد.
+
+## State
+تمام Signal IDها و وضعیت OPEN/CLOSED در `.state/whale_state.json` نگه‌داری می‌شوند و GitHub Actions آن را بین اجراها Cache می‌کند.
+
+## Telegram
+نسخه v5 قابلیت‌های v4 را حفظ می‌کند:
+- batching پیام‌های فرعی
+- اولویت بالاتر برای MAIN
+- فاصله بین پیام‌ها
+- retry خودکار برای HTTP 429
+
+## GitHub Secrets
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
+
+## اجرای خودکار
+`.github/workflows/scanner.yml` هر 5 دقیقه اجرا می‌شود.
