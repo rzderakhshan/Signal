@@ -36,6 +36,14 @@ MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "200000"))
 LOOKBACK_MS = int(os.getenv("LOOKBACK_MS", str(15 * 60 * 1000)))
 BOOTSTRAP_ALERTS = os.getenv("BOOTSTRAP_ALERTS", "false").lower() == "true"
 
+# Pending / approaching limit-order engine.
+# Distance is percentage from the current market mid; proximity is NOT a time prediction.
+NEW_LIMIT_MAX_DISTANCE_PCT = float(os.getenv("NEW_LIMIT_MAX_DISTANCE_PCT", "1.50"))
+APPROACH_DISTANCE_PCT = float(os.getenv("APPROACH_DISTANCE_PCT", "0.50"))
+CLUSTER_MAX_DISTANCE_PCT = float(os.getenv("CLUSTER_MAX_DISTANCE_PCT", "1.00"))
+CLUSTER_MIN_WHALES = int(os.getenv("CLUSTER_MIN_WHALES", "2"))
+CLUSTER_MIN_NOTIONAL_USD = float(os.getenv("CLUSTER_MIN_NOTIONAL_USD", "500000"))
+
 # Consensus / signal engine
 SECONDARY_MIN_SCORE = float(os.getenv("SECONDARY_MIN_SCORE", "68"))
 MAIN_MIN_WHALES = int(os.getenv("MAIN_MIN_WHALES", "4"))
@@ -99,7 +107,7 @@ class HyperliquidClient:
     def __init__(self, timeout: int = 20):
         self.timeout = timeout
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "HyperliquidWhaleTracker/6.0"})
+        self.session.headers.update({"User-Agent": "HyperliquidWhaleTracker/7.0"})
 
     def _post(self, payload: dict[str, Any]):
         last_error = None
@@ -176,9 +184,9 @@ def load_seed_whales() -> list[Whale]:
 
 def load_state() -> dict[str, Any]:
     blank = {
-        "version": 6, "initialized": False, "last_run_ms": 0,
+        "version": 7, "initialized": False, "last_run_ms": 0,
         "whales": {}, "consensus": {}, "ranking": {}, "ranking_updated_ms": 0,
-        "signals": {"active_main": {}, "active_whale": {}, "history": [], "daily_seq": {}},
+        "signals": {"active_main": {}, "active_whale": {}, "pending_limits": {}, "limit_clusters": {}, "history": [], "daily_seq": {}},
     }
     if not STATE_PATH.exists():
         return blank
@@ -203,6 +211,8 @@ def ensure_signal_state(state: dict[str, Any]) -> dict[str, Any]:
     signals = state.setdefault("signals", {})
     signals.setdefault("active_main", {})
     signals.setdefault("active_whale", {})
+    signals.setdefault("pending_limits", {})
+    signals.setdefault("limit_clusters", {})
     signals.setdefault("history", [])
     signals.setdefault("daily_seq", {})
     return signals
@@ -329,7 +339,7 @@ def discover_addresses(seed: list[Whale]) -> list[str]:
     """Discover current directional whales from HyperScan; seeds are always fallback candidates."""
     addresses = [w.address for w in seed]
     try:
-        r = requests.get(DISCOVERY_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 WhaleTracker/6.0"})
+        r = requests.get(DISCOVERY_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 WhaleTracker/7.0"})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         found: list[str] = []
@@ -479,6 +489,147 @@ def format_fill(whale: Whale, fill: dict[str, Any], pos: dict[str, Any] | None, 
             lines.append(f"Liquidation: <b>{pos['liq']:,.6g}</b>")
     lines.extend(["", f"<a href=\"https://app.hyperliquid.xyz/explorer/address/{whale.address}\">View wallet ↗</a>"])
     return "\n".join(lines)
+
+
+
+def order_side(order: dict[str, Any]) -> tuple[str, str]:
+    """Return display side and directional signal side."""
+    if str(order.get("side")) == "B":
+        return "BUY", "LONG"
+    return "SELL", "SHORT"
+
+
+def distance_pct(limit_px: float, market_px: float) -> float:
+    if limit_px <= 0 or market_px <= 0:
+        return 999.0
+    return abs(limit_px - market_px) / market_px * 100.0
+
+
+def format_pending_limit(
+    whale: Whale,
+    order: dict[str, Any],
+    signal_id: str,
+    market_px: float,
+    score: float,
+    lifecycle: str,
+) -> str:
+    coin = html.escape(str(order.get("coin", "?")))
+    px = fnum(order.get("limitPx"))
+    sz = abs(fnum(order.get("sz")))
+    ntl = px * sz
+    side, direction = order_side(order)
+    dist = distance_pct(px, market_px)
+
+    if lifecycle == "NEW":
+        title = "🟡 <b>PENDING WHALE SIGNAL</b>"
+        fa = "توضیح: سفارش لیمیت جدید و نزدیک قیمت فعلی است؛ هنوز معامله فعال نشده است."
+    else:
+        title = "🟠 <b>LIMIT APPROACHING</b>"
+        fa = "توضیح: این سفارش قبلاً وجود داشته اما حالا قیمت به محدوده فعال‌شدن آن نزدیک شده است. نزدیکی قیمت به معنی تضمین زمان اجرا نیست."
+
+    return "\n".join([
+        title, "",
+        f"ID: <code>{html.escape(signal_id)}</code>",
+        f"Grade: <b>{signal_grade(score)}</b> · Score: <b>{score:.0f}/100</b>",
+        f"Whale: <b>#{whale.rank}</b> · quality <b>{whale.quality:.0f}/100</b> · <code>{short_addr(whale.address)}</code>",
+        f"Coin: <b>{coin}</b> · Direction: <b>{direction}</b>",
+        f"Limit: <b>{px:,.6g}</b>",
+        f"Current: <b>{market_px:,.6g}</b>",
+        f"Distance: <b>{dist:.2f}%</b>",
+        f"Order value: <b>{money(ntl)}</b>",
+        f"Order ID: <code>{order.get('oid')}</code>",
+        "",
+        fa,
+    ])
+
+
+def format_limit_activated(
+    whale: Whale,
+    pending: dict[str, Any],
+    fill: dict[str, Any],
+    pos: dict[str, Any] | None,
+) -> str:
+    px = fnum(fill.get("px"))
+    coin = html.escape(str(fill.get("coin", pending.get("coin", "?"))))
+    crossed = bool(fill.get("crossed"))
+    execution = "MARKET/TAKER" if crossed else "LIMIT/MAKER FILL"
+    lines = [
+        "✅ <b>PENDING SIGNAL ACTIVATED</b>", "",
+        f"ID: <code>{html.escape(str(pending.get('id')))}</code>",
+        f"Whale: <b>#{whale.rank}</b> · <code>{short_addr(whale.address)}</code>",
+        f"Coin: <b>{coin}</b> · Direction: <b>{pending.get('side')}</b>",
+        f"Filled at: <b>{px:,.6g}</b>",
+        f"Execution: <b>{execution}</b>",
+    ]
+    if pos:
+        lines.extend([
+            f"Whale position entry: <b>{fnum(pos.get('entry')):,.6g}</b>",
+            f"Position: <b>{money(fnum(pos.get('value')))}</b>",
+        ])
+    lines.extend([
+        "",
+        "توضیح: سفارش منتظر اجرا شده و از حالت Pending به معامله فعال تبدیل شده است.",
+    ])
+    return "\n".join(lines)
+
+
+def format_market_entry_fa(
+    whale: Whale,
+    fill: dict[str, Any],
+    pos: dict[str, Any] | None,
+    score: float,
+) -> str:
+    base = format_fill(whale, fill, pos, score)
+    crossed = bool(fill.get("crossed"))
+    if crossed:
+        note = "توضیح: این Fill به‌صورت Taker/Market-like اجرا شده؛ یعنی ورود بالفعل انجام شده و سفارش منتظر نیست."
+    else:
+        note = "توضیح: این معامله اجرا شده است؛ داده Fill نشان می‌دهد ورود بالفعل انجام شده، هرچند می‌تواند اجرای سفارش Limit/Maker باشد."
+    return base + "\n\n" + note
+
+
+def build_limit_clusters(
+    nearby_orders: list[dict[str, Any]],
+    mids: dict[str, float],
+) -> dict[str, dict[str, Any]]:
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in nearby_orders:
+        buckets.setdefault((row["coin"], row["side"]), []).append(row)
+
+    out: dict[str, dict[str, Any]] = {}
+    for (coin, side), rows in buckets.items():
+        unique_whales = {r["whale"].address for r in rows}
+        total = sum(r["notional"] for r in rows)
+        if len(unique_whales) < CLUSTER_MIN_WHALES or total < CLUSTER_MIN_NOTIONAL_USD:
+            continue
+        prices = [r["limit_px"] for r in rows]
+        market = mids.get(coin, 0.0)
+        key = f"{coin}:{side}"
+        out[key] = {
+            "coin": coin,
+            "side": side,
+            "count": len(unique_whales),
+            "orders": len(rows),
+            "notional": total,
+            "min_px": min(prices),
+            "max_px": max(prices),
+            "market_px": market,
+            "whales": sorted(unique_whales),
+        }
+    return out
+
+
+def format_limit_cluster(c: dict[str, Any]) -> str:
+    return "\n".join([
+        "🔥 <b>WHALE LIMIT CLUSTER</b>", "",
+        f"Coin: <b>{html.escape(str(c['coin']))}</b> · Direction: <b>{c['side']}</b>",
+        f"Whales: <b>{c['count']}</b> · Orders: <b>{c['orders']}</b>",
+        f"Cluster zone: <b>{c['min_px']:,.6g} – {c['max_px']:,.6g}</b>",
+        f"Current: <b>{c['market_px']:,.6g}</b>",
+        f"Combined orders: <b>{money(c['notional'])}</b>",
+        "",
+        "توضیح: چند نهنگ در یک محدوده نزدیک به قیمت فعلی سفارش هم‌جهت دارند. این ناحیه می‌تواند محدوده مهم فعال‌شدن سفارش‌ها باشد؛ تضمین حمایت/مقاومت یا زمان اجرا نیست.",
+    ])
 
 
 def format_order(whale: Whale, order: dict[str, Any], status: str, score: float) -> str:
@@ -638,7 +789,7 @@ def format_whale_lifecycle(whale: Whale, fill: dict[str, Any], pos: dict[str, An
 
 def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
     if test_telegram:
-        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v6</b>\nSignal lifecycle + whale entry prices + Telegram delivery are working.")
+        ok = send_telegram_message("✅ <b>Hyperliquid Whale Tracker v7</b>\nSignal lifecycle + whale entry prices + Telegram delivery are working.")
         raise SystemExit(0 if ok else 2)
 
     state = load_state()
@@ -658,6 +809,7 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
 
     all_positions: dict[str, dict[str, dict[str, Any]]] = {}
     event_coins: set[str] = set()
+    nearby_limit_orders: list[dict[str, Any]] = []
     current_whale_addresses = {w.address for w in whales}
 
     for whale in whales:
@@ -684,7 +836,51 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
             previous_orders = ws.get("orders", {}) or {}
             should_alert = (not first_run) or BOOTSTRAP_ALERTS
 
+            # Track qualifying nearby orders on every run so old orders can become relevant later.
+            for oid, order in current_orders.items():
+                coin_o = str(order.get("coin"))
+                limit_px = fnum(order.get("limitPx"))
+                sz_o = abs(fnum(order.get("sz")))
+                notional_o = abs(limit_px * sz_o)
+                market_o = mids.get(coin_o, 0.0)
+                side_display, side_signal = order_side(order)
+                dist_o = distance_pct(limit_px, market_o)
+
+                if notional_o >= MIN_ORDER_USD and dist_o <= CLUSTER_MAX_DISTANCE_PCT:
+                    nearby_limit_orders.append({
+                        "whale": whale, "oid": oid, "coin": coin_o, "side": side_signal,
+                        "limit_px": limit_px, "market_px": market_o, "notional": notional_o,
+                    })
+
+                pending_key = f"{whale.address}:{oid}"
+                pending = signals["pending_limits"].get(pending_key)
+                is_new_order = oid not in previous_orders
+
+                if is_new_order and notional_o >= MIN_ORDER_USD and dist_o <= NEW_LIMIT_MAX_DISTANCE_PCT:
+                    score_o = event_score(whale, notional_o, positions.get(coin_o), "NEW ORDER")
+                    if score_o >= SECONDARY_MIN_SCORE:
+                        sid = next_signal_id(state, "PEND", coin_o, side_signal, now_ms)
+                        pending = {
+                            "id": sid, "type": "PENDING_LIMIT", "coin": coin_o, "side": side_signal,
+                            "whale": whale.address, "oid": oid, "limit_price": limit_px,
+                            "order_value": notional_o, "created_ms": now_ms, "status": "PENDING",
+                            "approach_alerted": dist_o <= APPROACH_DISTANCE_PCT,
+                        }
+                        signals["pending_limits"][pending_key] = pending
+                        queue_alert(format_pending_limit(whale, order, sid, market_o, score_o, "NEW"), priority=84)
+                elif pending:
+                    pending["last_market_px"] = market_o
+                    pending["last_distance_pct"] = dist_o
+                    pending["updated_ms"] = now_ms
+                    if (not pending.get("approach_alerted")) and dist_o <= APPROACH_DISTANCE_PCT:
+                        score_o = event_score(whale, notional_o, positions.get(coin_o), "APPROACHING ORDER")
+                        pending["approach_alerted"] = True
+                        pending["approach_ms"] = now_ms
+                        queue_alert(format_pending_limit(whale, order, pending["id"], market_o, score_o, "APPROACHING"), priority=88)
+
             if should_alert:
+                # Fills are actual executions. If a fill belongs to a tracked pending Limit,
+                # preserve that Pending Signal ID and transition it to ACTIVE.
                 for fill in new_fills:
                     coin = str(fill.get("coin"))
                     px = fnum(fill.get("px"))
@@ -697,6 +893,30 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
                     event_coins.add(coin)
                     whale_key = f"{whale.address}:{coin}"
                     active = signals["active_whale"].get(whale_key)
+
+                    fill_oid = str(fill.get("oid")) if fill.get("oid") is not None else ""
+                    pending_key = f"{whale.address}:{fill_oid}" if fill_oid else ""
+                    pending = signals["pending_limits"].get(pending_key) if pending_key else None
+
+                    if pending and action.startswith("NEW "):
+                        if active and active.get("id") != pending.get("id"):
+                            closed = dict(active)
+                            closed.update({"closed_ms": now_ms, "close_price": px, "close_reason": "Replaced by activated pending limit signal", "status": "CLOSED"})
+                            queue_alert(format_signal_close(closed, px, now_ms, closed["close_reason"], "WHALE"), priority=90)
+                            archive_signal(signals, closed)
+                        active = {
+                            "id": pending["id"], "type": "WHALE", "coin": coin, "side": fill_side,
+                            "open_price": px, "opened_ms": now_ms, "whale": whale.address,
+                            "whale_rank": whale.rank, "whale_quality": whale.quality, "status": "OPEN",
+                            "source": "PENDING_LIMIT", "limit_price": pending.get("limit_price"),
+                        }
+                        signals["active_whale"][whale_key] = active
+                        activated = dict(pending)
+                        activated.update({"status": "ACTIVATED", "activated_ms": now_ms, "fill_price": px})
+                        archive_signal(signals, activated)
+                        signals["pending_limits"].pop(pending_key, None)
+                        queue_alert(format_limit_activated(whale, pending, fill, pos), priority=94)
+                        continue
 
                     if action.startswith("NEW ") and score >= SECONDARY_MIN_SCORE:
                         if active and active.get("side") != fill_side:
@@ -712,9 +932,13 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
                                 "id": sid, "type": "WHALE", "coin": coin, "side": fill_side,
                                 "open_price": px, "opened_ms": now_ms, "whale": whale.address,
                                 "whale_rank": whale.rank, "whale_quality": whale.quality, "status": "OPEN",
+                                "source": "TAKER" if bool(fill.get("crossed")) else "EXECUTED_FILL",
                             }
                             signals["active_whale"][whale_key] = active
-                            queue_alert(format_whale_lifecycle(whale, fill, pos, score, sid, "OPEN"), priority=88 if score >= 88 else 78)
+                            queue_alert(format_whale_lifecycle(whale, fill, pos, score, sid, "OPEN") + "\n\n" +
+                                        ("توضیح: ورود Taker/Market-like انجام شده و معامله فعال است." if bool(fill.get("crossed"))
+                                         else "توضیح: Fill اجرا شده و معامله فعال است؛ ممکن است اجرای Limit/Maker باشد."),
+                                        priority=88 if score >= 88 else 78)
                         else:
                             queue_alert(format_whale_lifecycle(whale, fill, pos, score, active["id"], "UPDATE"), priority=72)
                     elif "CLOSE" in action and active:
@@ -731,24 +955,34 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
                         if active:
                             queue_alert(format_whale_lifecycle(whale, fill, pos, score, active["id"], "UPDATE"), priority=70)
                         else:
-                            queue_alert(format_fill(whale, fill, pos, score), priority=68)
+                            queue_alert(format_market_entry_fa(whale, fill, pos, score), priority=68)
 
-                for oid, order in current_orders.items():
-                    if oid not in previous_orders:
-                        notional = abs(fnum(order.get("limitPx")) * fnum(order.get("sz")))
-                        if notional >= MIN_ORDER_USD:
-                            score = event_score(whale, notional, positions.get(str(order.get("coin"))), "NEW ORDER")
-                            event_coins.add(str(order.get("coin")))
-                            if score >= SECONDARY_MIN_SCORE:
-                                queue_alert(format_order(whale, order, "NEW", score), priority=65 if score < 88 else 82)
-
+                # Orders that disappeared: distinguish a real activation from cancellation.
+                fill_oids = {str(f.get("oid")) for f in new_fills if f.get("oid") is not None}
                 for oid, old_order in previous_orders.items():
-                    if oid not in current_orders:
-                        notional = abs(fnum(old_order.get("limitPx")) * fnum(old_order.get("sz")))
-                        if notional >= MIN_ORDER_USD:
-                            score = event_score(whale, notional, positions.get(str(old_order.get("coin"))), "REMOVED ORDER")
-                            if score >= SECONDARY_MIN_SCORE + 5:
-                                queue_alert(format_order(whale, old_order, "REMOVED/FILLED", score), priority=60)
+                    if oid in current_orders:
+                        continue
+                    pending_key = f"{whale.address}:{oid}"
+                    pending = signals["pending_limits"].get(pending_key)
+                    if not pending:
+                        continue
+
+                    if oid in fill_oids:
+                        # Matching fill will have handled activation above.
+                        continue
+
+                    removed = dict(pending)
+                    removed.update({"status": "CANCELLED_OR_REMOVED", "closed_ms": now_ms})
+                    archive_signal(signals, removed)
+                    signals["pending_limits"].pop(pending_key, None)
+                    queue_alert("\n".join([
+                        "⚪ <b>PENDING LIMIT REMOVED</b>", "",
+                        f"ID: <code>{html.escape(str(pending['id']))}</code>",
+                        f"Coin: <b>{html.escape(str(pending['coin']))}</b> · Direction: <b>{pending['side']}</b>",
+                        f"Limit: <b>{fnum(pending.get('limit_price')):,.6g}</b>",
+                        "",
+                        "توضیح: سفارش دیگر در Order Book باز نیست و Fill متناظر در بازه بررسی پیدا نشد؛ بنابراین آن را Cancel/Removed در نظر می‌گیریم، نه معامله فعال.",
+                    ]), priority=55)
 
             ws["fills"] = list(dict.fromkeys((ws.get("fills", []) + current_fill_keys)))[-5000:]
             ws["orders"] = current_orders
@@ -781,6 +1015,21 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
             queue_alert(format_signal_close(closed, close_px, now_ms, closed["close_reason"], "WHALE"), priority=88)
             archive_signal(signals, closed)
             signals["active_whale"].pop(wkey, None)
+
+    # Aggregate near-price Limit Orders across whales.
+    current_clusters = build_limit_clusters(nearby_limit_orders, mids)
+    previous_clusters = signals.get("limit_clusters", {}) or {}
+    for ckey, cluster in current_clusters.items():
+        prev = previous_clusters.get(ckey)
+        should_send = (
+            not prev
+            or int(prev.get("count", 0)) != int(cluster["count"])
+            or abs(fnum(prev.get("notional")) - cluster["notional"]) / max(cluster["notional"], 1.0) >= 0.20
+            or abs(fnum(prev.get("market_px")) - cluster["market_px"]) / max(cluster["market_px"], 1.0) >= 0.005
+        )
+        if should_send and ((not first_run) or BOOTSTRAP_ALERTS):
+            queue_alert(format_limit_cluster(cluster), priority=91)
+    signals["limit_clusters"] = current_clusters
 
     new_consensus = build_consensus(whales, all_positions)
     active_main = signals["active_main"]
@@ -835,7 +1084,7 @@ def run_once(test_telegram: bool = False, refresh_ranking_now: bool = False):
     state["consensus"] = new_consensus
     state["last_run_ms"] = now_ms
     state["initialized"] = True
-    state["version"] = 6
+    state["version"] = 7
     save_state(state)
     flush_alerts()
     logging.info(

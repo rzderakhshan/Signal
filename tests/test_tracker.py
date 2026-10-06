@@ -37,3 +37,24 @@ def test_signal_id_sequence_and_result():
     assert close_result_pct("LONG", 100, 110) == 10
     assert close_result_pct("SHORT", 100, 90) == 10
     assert duration_text(0, 3_660_000) == "1h 1m"
+
+
+from whale_tracker import distance_pct, build_limit_clusters
+
+
+def test_distance_pct():
+    assert round(distance_pct(99, 100), 2) == 1.0
+    assert round(distance_pct(101, 100), 2) == 1.0
+
+
+def test_limit_cluster_requires_multiple_whales():
+    w1 = Whale("w1", "0x" + "1"*40, 90, 1)
+    w2 = Whale("w2", "0x" + "2"*40, 80, 2)
+    rows = [
+        {"whale": w1, "oid": "1", "coin": "BTC", "side": "LONG", "limit_px": 99000, "market_px": 100000, "notional": 400000},
+        {"whale": w2, "oid": "2", "coin": "BTC", "side": "LONG", "limit_px": 99500, "market_px": 100000, "notional": 400000},
+    ]
+    clusters = build_limit_clusters(rows, {"BTC": 100000})
+    c = clusters["BTC:LONG"]
+    assert c["count"] == 2
+    assert c["notional"] == 800000
